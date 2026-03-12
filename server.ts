@@ -392,6 +392,7 @@ const broadcastState = () => {
 
     const activePlayerId = gameState.seats[gameState.activePlayerIndex];
     if (activePlayerId && gameState.players[activePlayerId]?.isBot) {
+      addLog(`Bot ${activePlayerId} turn start in phase ${gameState.phase}`, -1);
       setTimeout(() => {
         if (!gameState.gameStarted) return;
         const currentActiveId = gameState.seats[gameState.activePlayerIndex];
@@ -399,18 +400,47 @@ const broadcastState = () => {
 
         const currentPhase = gameState.phase;
         console.log(`Bot ${activePlayerId} is taking turn in phase ${currentPhase}`);
+        addLog(`Bot ${activePlayerId} executing action in phase ${currentPhase}`, -1);
         
         const botSocket = { id: activePlayerId, emit: () => {}, broadcast: { emit: () => {} } };
 
         switch (currentPhase) {
           case 'action_play':
             console.log(`Bot ${activePlayerId} passes in action_play`);
+            addLog(`Bot ${activePlayerId} passing action_play`, -1);
             handlers.pass_action(botSocket);
             break;
 
           case 'action_defend':
-            console.log(`Bot ${activePlayerId} passes in action_defend`);
-            handlers.pass_defend(botSocket);
+            console.log(`Bot ${activePlayerId} is in action_defend, checking for defense cards in play area`);
+            addLog(`Bot ${activePlayerId} checking defense cards in play area`, -1);
+            const hasDefenseInPlay = gameState.playAreaCards.some(c => c.name === '防御' || c.name === '闪避');
+            if (hasDefenseInPlay) {
+                console.log(`Bot ${activePlayerId} has defense card in play area, declaring defend`);
+                handlers.declare_defend(botSocket);
+            } else {
+                console.log(`Bot ${activePlayerId} has no defense card in play area, passing`);
+                handlers.pass_defend(botSocket);
+            }
+            break;
+
+          case 'action_play_defense':
+            console.log(`Bot ${activePlayerId} is in action_play_defense, checking for defense cards`);
+            addLog(`Bot ${activePlayerId} checking defense cards in action_play_defense`, -1);
+            const player = gameState.players[activePlayerId];
+            const defenseCard = player?.hand.find(c => c.name === '防御' || c.name === '闪避');
+            if (defenseCard) {
+                console.log(`Bot ${activePlayerId} plays defense card: ${defenseCard.name}`);
+                const isPlayer1 = gameState.seats[0] === activePlayerId;
+                const x = 0; 
+                const y = isPlayer1 ? 550 : -700;
+                handlers.play_card(botSocket, { cardId: defenseCard.id, x, y });
+            } else {
+                console.log(`Bot ${activePlayerId} has no defense card, passing`);
+                gameState.phase = 'action_resolve_attack';
+                gameState.activePlayerIndex = 1 - gameState.activePlayerIndex;
+                broadcastState();
+            }
             break;
 
           case 'action_resolve_attack':
@@ -458,7 +488,7 @@ const broadcastState = () => {
             handlers.finish_resolve(botSocket);
             break;
         }
-      }, 1500);
+      }, 800);
     }
   };
 
@@ -492,7 +522,7 @@ const broadcastState = () => {
             if (counter.boundToCardId) {
               const heroCard = gameState.tableCards.find(c => c.id === counter.boundToCardId);
               if (heroCard && heroCard.type === 'hero') {
-                if (counter.value >= 1) {
+                if (counter.value >= 2) {
                   countersToRemove.push(counter.id);
                   // Revive hero at capital
                   const token = gameState.tokens.find(t => t.boundToCardId === heroCard.id);
@@ -592,10 +622,67 @@ const broadcastState = () => {
       const playerIndex = isPlayer1 ? 0 : (isPlayer2 ? 1 : -1);
       
       if (gameState.phase === 'action_defend' && playerIndex === gameState.activePlayerIndex) {
+        addLog(`玩家${playerIndex + 1}放弃防御 (Pass Defend)`, playerIndex);
         gameState.phase = 'action_resolve_attack';
         gameState.activePlayerIndex = 1 - gameState.activePlayerIndex;
-        addLog(`玩家${playerIndex + 1}放弃防御`, playerIndex);
-        io.emit('state_update', gameState);
+        broadcastState();
+        checkBotTurn();
+      }
+    },
+    declare_defend: (socket: any) => {
+      const isPlayer1 = gameState.seats[0] === socket.id;
+      const isPlayer2 = gameState.seats[1] === socket.id;
+      const playerIndex = isPlayer1 ? 0 : (isPlayer2 ? 1 : -1);
+      
+      if (gameState.phase === 'action_defend' && playerIndex === gameState.activePlayerIndex) {
+        addLog(`玩家${playerIndex + 1}选择防御 (Declare Defend)`, playerIndex);
+        const hasDefenseCard = gameState.playAreaCards.some(c => c.name === '防御' || c.name === '闪避');
+        if (hasDefenseCard) {
+          gameState.phase = 'action_resolve_attack';
+          gameState.activePlayerIndex = 1 - gameState.activePlayerIndex;
+        } else {
+          gameState.phase = 'action_play_defense';
+          gameState.notification = '请打出一张防御卡。 (Please play a defense card.)';
+        }
+        broadcastState();
+        checkBotTurn();
+      }
+    },
+    declare_counter: (socket: any) => {
+      const isPlayer1 = gameState.seats[0] === socket.id;
+      const isPlayer2 = gameState.seats[1] === socket.id;
+      const playerIndex = isPlayer1 ? 0 : (isPlayer2 ? 1 : -1);
+      
+      if (gameState.phase === 'action_defend' && playerIndex === gameState.activePlayerIndex) {
+        addLog(`玩家${playerIndex + 1}选择反击 (Declare Counter)`, playerIndex);
+        const attackerToken = gameState.tokens.find(t => t.id === gameState.selectedTokenId);
+        const defenderCard = gameState.tableCards.find(c => c.id === gameState.selectedTargetId);
+        const defenderToken = gameState.tokens.find(t => t.boundToCardId === gameState.selectedTargetId);
+        
+        if (attackerToken && defenderToken && defenderCard) {
+          const attackerHex = pixelToHex(attackerToken.x, attackerToken.y);
+          const defenderHex = pixelToHex(defenderToken.x, defenderToken.y);
+          const dist = hexDistance(attackerHex.q, attackerHex.r, defenderHex.q, defenderHex.r);
+          
+          const heroData = heroesDatabase?.heroes?.find((h: any) => h.name === defenderCard.heroClass);
+          const levelData = heroData?.levels?.[defenderCard.level || 1];
+          const ar = levelData?.ar || 1;
+          
+          if (dist > ar) {
+            socket.emit('error_message', '攻击者不在反击范围内。 (Attacker is out of counter-attack range.)');
+            return;
+          }
+        }
+
+        const hasDefenseCard = gameState.playAreaCards.some(c => c.name === '防御' || c.name === '闪避');
+        if (hasDefenseCard) {
+          gameState.phase = 'action_resolve_attack_counter';
+          gameState.activePlayerIndex = 1 - gameState.activePlayerIndex;
+        } else {
+          gameState.phase = 'action_play_defense';
+          gameState.notification = '请打出一张防御卡。 (Please play a defense card.)';
+        }
+        broadcastState();
         checkBotTurn();
       }
     },
@@ -642,6 +729,19 @@ const broadcastState = () => {
               gameState.counters.push({ id: generateId(), type: 'time', x: targetCard.x, y: targetCard.y, value: 0, boundToCardId: targetCard.id });
               
               gameState.notification += ` ${targetCard.heroClass} 阵亡！ (Hero died!)`;
+
+              // Reward attacker
+              const attackerToken = gameState.tokens.find(t => t.id === gameState.selectedTokenId);
+              if (attackerToken && attackerToken.boundToCardId) {
+                const reward = targetCard.level || 1;
+                const expCounter = gameState.counters.find(c => c.type === 'exp' && c.boundToCardId === attackerToken.boundToCardId);
+                if (expCounter) expCounter.value += reward;
+                
+                const goldCounter = gameState.counters.find(c => c.type === 'gold' && (playerIndex === 0 ? (c.x === -150 && c.y === 550) : (c.x === -150 && c.y === -700)));
+                if (goldCounter) goldCounter.value += reward;
+                
+                gameState.notification += ` 获得 ${reward} 经验和 ${reward} 金币。 (Gained ${reward} EXP and ${reward} Gold.)`;
+              }
             }
           }
         } else if (hasDefense) {
@@ -690,6 +790,19 @@ const broadcastState = () => {
               if (token) { token.x = targetCard.x; token.y = targetCard.y; }
               gameState.counters.push({ id: generateId(), type: 'time', x: targetCard.x, y: targetCard.y, value: 0, boundToCardId: targetCard.id });
               gameState.notification += ` ${targetCard.heroClass} 阵亡！`;
+
+              // Reward attacker
+              const attackerToken = gameState.tokens.find(t => t.id === gameState.selectedTokenId);
+              if (attackerToken && attackerToken.boundToCardId) {
+                const reward = targetCard.level || 1;
+                const expCounter = gameState.counters.find(c => c.type === 'exp' && c.boundToCardId === attackerToken.boundToCardId);
+                if (expCounter) expCounter.value += reward;
+                
+                const goldCounter = gameState.counters.find(c => c.type === 'gold' && (playerIndex === 0 ? (c.x === -150 && c.y === 550) : (c.x === -150 && c.y === -700)));
+                if (goldCounter) goldCounter.value += reward;
+                
+                gameState.notification += ` 获得 ${reward} 经验和 ${reward} 金币。`;
+              }
             }
           }
         }
@@ -733,6 +846,18 @@ const broadcastState = () => {
                 attackerToken.y = attackerCard.y;
                 gameState.counters.push({ id: generateId(), type: 'time', x: attackerCard.x, y: attackerCard.y, value: 0, boundToCardId: attackerCard.id });
                 gameState.notification += ` ${attackerCard.heroClass} 阵亡！`;
+
+                // Reward defender (who is playerIndex)
+                if (gameState.selectedTargetId) {
+                  const reward = attackerCard.level || 1;
+                  const expCounter = gameState.counters.find(c => c.type === 'exp' && c.boundToCardId === gameState.selectedTargetId);
+                  if (expCounter) expCounter.value += reward;
+                  
+                  const goldCounter = gameState.counters.find(c => c.type === 'gold' && (playerIndex === 0 ? (c.x === -150 && c.y === 550) : (c.x === -150 && c.y === -700)));
+                  if (goldCounter) goldCounter.value += reward;
+                  
+                  gameState.notification += ` 获得 ${reward} 经验和 ${reward} 金币。`;
+                }
               }
             }
           }
@@ -1981,6 +2106,7 @@ const broadcastState = () => {
               gameState.activePlayerIndex = 1 - gameState.activePlayerIndex;
               gameState.reachableCells = [];
               broadcastState();
+              checkBotTurn();
             }
           }
         }
@@ -2018,60 +2144,9 @@ const broadcastState = () => {
       broadcastState();
     });
 
-    socket.on('declare_defend', () => {
-      const isPlayer1 = gameState.seats[0] === socket.id;
-      const isPlayer2 = gameState.seats[1] === socket.id;
-      const playerIndex = isPlayer1 ? 0 : (isPlayer2 ? 1 : -1);
-      
-      if (gameState.phase === 'action_defend' && playerIndex === gameState.activePlayerIndex) {
-        const hasDefenseCard = gameState.playAreaCards.some(c => c.name === '防御' || c.name === '闪避');
-        if (hasDefenseCard) {
-          gameState.phase = 'action_resolve_attack';
-          gameState.activePlayerIndex = 1 - gameState.activePlayerIndex;
-        } else {
-          gameState.phase = 'action_play_defense';
-          gameState.notification = '请打出一张防御卡。 (Please play a defense card.)';
-        }
-        broadcastState();
-      }
-    });
+    socket.on('declare_defend', () => handlers.declare_defend(socket));
 
-    socket.on('declare_counter', () => {
-      const isPlayer1 = gameState.seats[0] === socket.id;
-      const isPlayer2 = gameState.seats[1] === socket.id;
-      const playerIndex = isPlayer1 ? 0 : (isPlayer2 ? 1 : -1);
-      
-      if (gameState.phase === 'action_defend' && playerIndex === gameState.activePlayerIndex) {
-        const attackerToken = gameState.tokens.find(t => t.id === gameState.selectedTokenId);
-        const defenderCard = gameState.tableCards.find(c => c.id === gameState.selectedTargetId);
-        const defenderToken = gameState.tokens.find(t => t.boundToCardId === gameState.selectedTargetId);
-        
-        if (attackerToken && defenderToken && defenderCard) {
-          const attackerHex = pixelToHex(attackerToken.x, attackerToken.y);
-          const defenderHex = pixelToHex(defenderToken.x, defenderToken.y);
-          const dist = hexDistance(attackerHex.q, attackerHex.r, defenderHex.q, defenderHex.r);
-          
-          const heroData = heroesDatabase?.heroes?.find((h: any) => h.name === defenderCard.heroClass);
-          const levelData = heroData?.levels?.[defenderCard.level || 1];
-          const ar = levelData?.ar || 1;
-          
-          if (dist > ar) {
-            socket.emit('error_message', '攻击者不在反击范围内。 (Attacker is out of counter-attack range.)');
-            return;
-          }
-        }
-
-        const hasDefenseCard = gameState.playAreaCards.some(c => c.name === '防御' || c.name === '闪避');
-        if (hasDefenseCard) {
-          gameState.phase = 'action_resolve_attack_counter';
-          gameState.activePlayerIndex = 1 - gameState.activePlayerIndex;
-        } else {
-          gameState.phase = 'action_play_counter';
-          gameState.notification = '请打出一张攻击卡。 (Please play an attack card.)';
-        }
-        broadcastState();
-      }
-    });
+    socket.on('declare_counter', () => handlers.declare_counter(socket));
 
     socket.on('cancel_defend_or_counter', () => {
       const isPlayer1 = gameState.seats[0] === socket.id;
@@ -2081,7 +2156,8 @@ const broadcastState = () => {
       if ((gameState.phase === 'action_play_defense' || gameState.phase === 'action_play_counter') && playerIndex === gameState.activePlayerIndex) {
         gameState.phase = 'action_defend';
         gameState.notification = null;
-        io.emit('state_update', gameState);
+        broadcastState();
+        checkBotTurn();
       }
     });
 

@@ -1357,10 +1357,10 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId, i
 
             {!gameState.gameStarted && (
               <button 
-                onClick={() => socket.emit('start_game')}
+                onClick={() => socket.emit(gameState.notification?.includes('游戏结束') ? 'reset_game' : 'start_game')}
                 className="w-full py-3 mt-4 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-lg font-bold shadow-[0_0_20px_rgba(79,70,229,0.3)] transition-all"
               >
-                确定 (Start Game)
+                {gameState.notification?.includes('游戏结束') ? '重置游戏 (Reset Game)' : '确定 (Start Game)'}
               </button>
             )}
           </div>
