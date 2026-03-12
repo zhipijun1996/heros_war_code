@@ -1333,22 +1333,36 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId, i
                         )}
                       </div>
                     ) : (
-                      <button 
-                        onClick={() => {
-                          if (!playerNameInput.trim()) {
-                            setErrorMsg("请输入名称 (Please enter a name)");
-                            setTimeout(() => setErrorMsg(null), 3000);
-                            return;
-                          }
-                          socket.emit('sit_down', { seatIndex, playerName: playerNameInput.trim() });
-                          if (gameState.gameStarted) {
-                            setShowJoinOverlay(false);
-                          }
-                        }}
-                        className="px-4 py-1 bg-zinc-700 hover:bg-zinc-600 text-white rounded-lg text-sm transition-colors"
-                      >
-                        坐下 (Sit)
-                      </button>
+                      <div className="flex gap-2">
+                        <button 
+                          onClick={() => {
+                            if (!playerNameInput.trim()) {
+                              setErrorMsg("请输入名称 (Please enter a name)");
+                              setTimeout(() => setErrorMsg(null), 3000);
+                              return;
+                            }
+                            socket.emit('sit_down', { seatIndex, playerName: playerNameInput.trim() });
+                            if (gameState.gameStarted) {
+                              setShowJoinOverlay(false);
+                            }
+                          }}
+                          className="px-4 py-1 bg-zinc-700 hover:bg-zinc-600 text-white rounded-lg text-sm transition-colors"
+                        >
+                          坐下 (Sit)
+                        </button>
+                        <div className="flex bg-zinc-900 rounded-lg overflow-hidden border border-zinc-700">
+                          {[0, 1, 2].map(diff => (
+                            <button
+                              key={diff}
+                              onClick={() => socket.emit('add_bot', { seatIndex, difficulty: diff })}
+                              className="px-2 py-1 hover:bg-indigo-600 text-zinc-400 hover:text-white text-xs transition-colors border-r border-zinc-700 last:border-r-0"
+                              title={`添加难度 ${diff} 电脑`}
+                            >
+                              AI{diff}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
                     )}
                   </div>
                 );

@@ -43,6 +43,7 @@ export interface Player {
   name: string;
   hand: Card[];
   isBot?: boolean;
+  botDifficulty?: number;
   discardHistory?: Card[];
   discardFinished?: boolean;
 }
@@ -118,5 +119,6 @@ export interface GameState {
   movementHistory?: MovementStep[];
   canHire?: boolean;
   castleHP: Record<number, number>;
+  roundActionCounts: Record<string, number>;
   logs: GameLog[];
 }
