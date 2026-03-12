@@ -805,7 +805,12 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId }:
         return `间谍：点击完成结算以随机弃掉对手一张手牌 (Spy: Click Finish Resolve to discard opponent's card)`;
       } else if (gameState.selectedOption === 'seize') {
         return `抢先手：点击完成结算以获得下回合先手 (Seize: Click Finish Resolve to get initiative)`;
-      } else if (gameState.selectedOption === 'attack' || gameState.selectedOption === 'sprint') {
+      } else if (gameState.selectedOption === 'move' || gameState.selectedOption === 'sprint') {
+        if (gameState.selectedTokenId) {
+          return `已选择英雄，请点击高亮的格子以移动 (Hero selected, click a highlighted cell to move)`;
+        }
+        return `移动：请选择一个己方英雄 (Move: Select a hero)`;
+      } else if (gameState.selectedOption === 'attack') {
         if (gameState.selectedTokenId) {
           return `已选择英雄，请点击高亮的攻击目标 (Hero selected, click a highlighted target)`;
         }
@@ -814,16 +819,20 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId }:
       return `结算阶段：请${activePlayerStr}结算场面`;
     }
     if (gameState.phase === 'action_defend') {
-      return `防御阶段：请${activePlayerStr}打出防御卡（或Pass），并选择防御/反击`;
+      const hasDefenseCard = gameState.playAreaCards.some(c => c.name === '防御' || c.name === '闪避');
+      if (hasDefenseCard) {
+        return `防御阶段：请${activePlayerStr}选择防御或反击 (Choose Defend or Counter)`;
+      }
+      return `防御阶段：请${activePlayerStr}打出防御卡（或Pass） (Play a defense card or Pass)`;
     }
     if (gameState.phase === 'action_resolve_attack') {
       return `攻击结算：请${activePlayerStr}结算攻击`;
     }
     if (gameState.phase === 'action_resolve_attack_counter') {
-      return `攻击结算：请${activePlayerStr}结算攻击，随后由${inactivePlayerStr}结算反击`;
+      return `攻击结算：请${activePlayerStr}结算攻击 (Settle attack)`;
     }
     if (gameState.phase === 'action_resolve_counter') {
-      return `反击结算：请${activePlayerStr}结算反击`;
+      return `反击结算：请${activePlayerStr}结算反击 (Settle counter-attack)`;
     }
     if (gameState.phase === 'shop') {
       return `商店阶段：请${activePlayerStr}购买装备或雇佣英雄`;
@@ -920,10 +929,7 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId }:
                     <button onClick={() => socket.emit('select_option', 'move')} className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg font-bold">
                       移动
                     </button>
-                    <button onClick={() => {
-                      console.log('Attacking...');
-                      socket.emit('select_option', 'attack');
-                    }} className="px-4 py-2 bg-red-600 hover:bg-red-500 text-white rounded-lg font-bold">
+                    <button onClick={() => socket.emit('select_option', 'attack')} className="px-4 py-2 bg-red-600 hover:bg-red-500 text-white rounded-lg font-bold">
                       攻击
                     </button>
                     <button onClick={() => socket.emit('select_option', 'skill')} className="px-4 py-2 bg-purple-600 hover:bg-purple-500 text-white rounded-lg font-bold">
@@ -1184,14 +1190,7 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId }:
     }
   };
 
-  const [debugLogs, setDebugLogs] = useState<string[]>([]);
-  const addDebugLog = (msg: string) => {
-    setDebugLogs(prev => [...prev.slice(-4), msg]);
-    console.log(msg);
-  };
-
   const handleTokenClick = (id: string) => {
-    addDebugLog(`handleTokenClick called with id: ${id}, selectedOption: ${gameState.selectedOption}`);
     if (gameState.phase === 'action_select_option' && isActivePlayer) {
       if (gameState.selectedOption === 'move' || gameState.selectedOption === 'sprint' || gameState.selectedOption === 'attack' || gameState.selectedOption === 'heavy_strike') {
         socket.emit('select_token', id);
@@ -1206,11 +1205,6 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId }:
           {errorMsg}
         </div>
       )}
-
-      {/* Debug Logs */}
-      <div className="absolute top-40 left-4 z-[1000] bg-black/80 text-white p-2 rounded text-xs pointer-events-none">
-        {debugLogs.map((log, i) => <div key={i}>{log}</div>)}
-      </div>
 
       {/* Prompt Area */}
       {gameState.gameStarted && (
@@ -1254,16 +1248,6 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId }:
             </button>
           )}
         </div>
-      )}
-
-      {/* Steal First Player Button */}
-      {gameState.gameStarted && playerIndex !== -1 && playerIndex !== gameState.firstPlayerIndex && (
-        <button 
-          onClick={() => socket.emit('steal_first_player')}
-          className="absolute bottom-4 right-4 px-4 py-2 bg-amber-600 hover:bg-amber-500 text-white rounded-lg font-bold shadow-lg z-50 pointer-events-auto"
-        >
-          抢先手 (Steal First Player)
-        </button>
       )}
 
       {/* Spectator Join Button */}
