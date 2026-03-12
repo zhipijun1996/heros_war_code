@@ -17,10 +17,12 @@ export default function Controls({ socket }: ControlsProps) {
 
   const addCounter = (type: 'gold' | 'exp' | 'damage' | 'time' | 'level') => {
     socket.emit('add_counter', { type, x: 0, y: 0 });
+    setIsExpanded(false);
   };
 
   const spawnHero = (level: number) => {
     socket.emit('spawn_hero', { heroClass: selectedClass, level, x: 0, y: 0 });
+    setIsExpanded(false);
   };
 
   if (!isExpanded) {
@@ -151,7 +153,7 @@ export default function Controls({ socket }: ControlsProps) {
       {/* Game Controls */}
       <div className="bg-zinc-900/90 border border-zinc-800 rounded-xl p-2 shadow-2xl backdrop-blur-sm w-48">
         <button
-          onClick={() => socket.emit('reset_game')}
+          onClick={() => { socket.emit('reset_game'); setIsExpanded(false); }}
           className="flex items-center justify-center gap-2 w-full py-2 text-red-400 hover:text-red-300 hover:bg-red-400/10 rounded-lg text-sm font-medium transition-colors"
         >
           <RotateCcw size={16} />

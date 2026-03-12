@@ -1,24 +1,33 @@
 import { useState, useRef } from 'react';
 import { Socket } from 'socket.io-client';
-import { Card } from '../types';
+import { Card, GameState } from '../types';
 import { motion } from 'motion/react';
 
 interface HandProps {
   socket: Socket;
   hand: Card[];
   setZoomedCard: (card: Card | null) => void;
+  gameState: GameState;
 }
 
-export default function Hand({ socket, hand, setZoomedCard }: HandProps) {
+export default function Hand({ socket, hand, setZoomedCard, gameState }: HandProps) {
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
   const clickTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   const playCard = (cardId: string) => {
+    if (gameState.phase === 'discard') {
+      socket.emit('error_message', '弃牌阶段无法出牌。');
+      return;
+    }
     // Play card to the center of the map (0,0)
     socket.emit('play_card', { cardId, x: 0, y: 0 });
   };
 
   const handleCardClick = (cardId: string) => {
+    if (gameState.phase === 'discard') {
+      socket.emit('discard_card', cardId);
+      return;
+    }
     if (clickTimeoutRef.current) {
       clearTimeout(clickTimeoutRef.current);
       clickTimeoutRef.current = null;
