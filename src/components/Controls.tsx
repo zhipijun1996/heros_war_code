@@ -4,6 +4,8 @@ import { Coins, Star, Heart, RotateCcw, Shield, Swords, Clock, ArrowUpCircle, Me
 
 interface ControlsProps {
   socket: Socket;
+  isHistoryVisible: boolean;
+  setIsHistoryVisible: (visible: boolean) => void;
 }
 
 const HERO_CLASSES = [
@@ -11,7 +13,7 @@ const HERO_CLASSES = [
   '弓箭手', '冰法师', '火法师', '圣职者', '指挥官'
 ];
 
-export default function Controls({ socket }: ControlsProps) {
+export default function Controls({ socket, isHistoryVisible, setIsHistoryVisible }: ControlsProps) {
   const [selectedClass, setSelectedClass] = useState(HERO_CLASSES[0]);
   const [isExpanded, setIsExpanded] = useState(false);
 
@@ -152,6 +154,13 @@ export default function Controls({ socket }: ControlsProps) {
 
       {/* Game Controls */}
       <div className="bg-zinc-900/90 border border-zinc-800 rounded-xl p-2 shadow-2xl backdrop-blur-sm w-48">
+        <button
+          onClick={() => setIsHistoryVisible(!isHistoryVisible)}
+          className={`flex items-center justify-center gap-2 w-full py-2 ${isHistoryVisible ? 'text-emerald-400' : 'text-zinc-400'} hover:text-white hover:bg-zinc-800 rounded-lg text-sm font-medium transition-colors`}
+        >
+          <Clock size={16} />
+          {isHistoryVisible ? 'Hide History' : 'Show History'}
+        </button>
         <button
           onClick={() => { socket.emit('reset_game'); setIsExpanded(false); }}
           className="flex items-center justify-center gap-2 w-full py-2 text-red-400 hover:text-red-300 hover:bg-red-400/10 rounded-lg text-sm font-medium transition-colors"

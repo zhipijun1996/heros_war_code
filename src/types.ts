@@ -117,5 +117,6 @@ export interface GameState {
   lastEvolvedId?: string | null;
   movementHistory?: MovementStep[];
   canHire?: boolean;
+  castleHP: Record<number, number>;
   logs: GameLog[];
 }

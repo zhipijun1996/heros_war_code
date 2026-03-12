@@ -12,6 +12,7 @@ interface TabletopProps {
   gameState: GameState;
   setZoomedCard: (card: Card | null) => void;
   playerId: string;
+  isHistoryVisible: boolean;
 }
 
 const HEX_SIZE = 45;
@@ -231,7 +232,7 @@ function DeckNode({ x, y, type, count, label, backImage, onContextMenu, socket }
   );
 }
 
-function TokenNode({ token, socket, onClick, isSelected, draggable, lastEvolvedId }: { token: Token; socket: Socket, onClick?: (id: string) => void, isSelected?: boolean, draggable?: boolean, lastEvolvedId?: string | null }) {
+function TokenNode({ token, socket, onClick, isSelected, draggable, lastEvolvedId, onHexClick, isMyToken }: { token: Token; socket: Socket, onClick?: (id: string) => void, isSelected?: boolean, draggable?: boolean, lastEvolvedId?: string | null, onHexClick?: (q: number, r: number) => void, isMyToken?: boolean }) {
   const [image] = useImage(token.image);
   const groupRef = useRef<any>(null);
 
@@ -253,8 +254,24 @@ function TokenNode({ token, socket, onClick, isSelected, draggable, lastEvolvedI
       y={token.y}
       draggable={draggable}
       listening={true}
-      onClick={(e) => { e.cancelBubble = true; onClick?.(token.id); }}
-      onTap={(e) => { e.cancelBubble = true; onClick?.(token.id); }}
+      onClick={(e) => { 
+        e.cancelBubble = true; 
+        if (isMyToken) {
+          onClick?.(token.id); 
+        } else {
+          const hex = pixelToHex(token.x, token.y);
+          onHexClick?.(hex.q, hex.r);
+        }
+      }}
+      onTap={(e) => { 
+        e.cancelBubble = true; 
+        if (isMyToken) {
+          onClick?.(token.id); 
+        } else {
+          const hex = pixelToHex(token.x, token.y);
+          onHexClick?.(hex.q, hex.r);
+        }
+      }}
       onDragEnd={(e) => {
         const newX = e.target.x();
         const newY = e.target.y();
@@ -493,10 +510,11 @@ function CounterNode({ counter, socket }: { counter: Counter; socket: Socket }) 
   );
 }
 
-function HistoryLogGroup({ logs }: { logs: GameLog[] }) {
+function HistoryLogGroup({ logs, isVisible, position, onDragEnd }: { logs: GameLog[], isVisible: boolean, position: { x: number, y: number }, onDragEnd: (pos: { x: number, y: number }) => void }) {
+  if (!isVisible) return null;
   const displayLogs = logs.slice(-18); // Show last 18 logs
   return (
-    <Group x={-850} y={-450}>
+    <Group x={position.x} y={position.y} draggable onDragEnd={(e) => onDragEnd({ x: e.target.x(), y: e.target.y() })}>
       <Rect 
         width={350} 
         height={450} 
@@ -545,7 +563,7 @@ function HistoryLogGroup({ logs }: { logs: GameLog[] }) {
   );
 }
 
-export default function Tabletop({ socket, gameState, setZoomedCard, playerId }: TabletopProps) {
+export default function Tabletop({ socket, gameState, setZoomedCard, playerId, isHistoryVisible }: TabletopProps) {
   const containerRef = useRef<HTMLDivElement>(null);
 
   const calculateInitialScale = (w: number, h: number) => {
@@ -560,6 +578,7 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId }:
   const [menu, setMenu] = useState<{ x: number, y: number, type: 'deck' | 'card' | 'hex', targetId: string, targetX?: number, targetY?: number } | null>(null);
   const [hirePopup, setHirePopup] = useState<{ cardId: string } | null>(null);
   const [showExplosion, setShowExplosion] = useState<{ x: number, y: number } | null>(null);
+  const [historyPos, setHistoryPos] = useState({ x: -850, y: -450 });
 
   useEffect(() => {
     if (gameState.lastEvolvedId) {
@@ -1264,6 +1283,11 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId }:
       {(!gameState.gameStarted || showJoinOverlay) && (
         <div className="absolute inset-0 bg-black/80 flex items-center justify-center z-[200] pointer-events-auto backdrop-blur-sm">
           <div className="bg-zinc-900 border border-zinc-700 rounded-2xl p-8 max-w-md w-full shadow-2xl flex flex-col items-center gap-6 relative">
+            {gameState.notification && !gameState.gameStarted && (
+              <div className="text-xl font-bold text-emerald-400 text-center mb-4 animate-pulse">
+                {gameState.notification}
+              </div>
+            )}
             {gameState.gameStarted && (
               <button 
                 onClick={() => setShowJoinOverlay(false)}
@@ -1407,14 +1431,14 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId }:
             <Group x={0} y={450}>
               <Rect width={250} height={40} fill="rgba(0,0,0,0.5)" cornerRadius={20} x={-125} />
               <Text 
-                text={`玩家 1 手牌: ${gameState.players[gameState.seats[0]].hand.length} | 英雄: ${gameState.tableCards.filter(c => c.type === 'hero' && Math.abs(c.y - 550) < 100).length}`} 
+                text={`玩家 1 手牌: ${gameState.players[gameState.seats[0]].hand.length} | 英雄: ${gameState.tableCards.filter(c => c.type === 'hero' && Math.abs(c.y - 550) < 100).length} | 王城血量: ${gameState.castleHP[0] || 0}`} 
                 fill="white" 
-                width={250} 
+                width={300} 
                 align="center" 
                 y={12} 
                 fontSize={16} 
                 fontStyle="bold" 
-                x={-125}
+                x={-150}
               />
             </Group>
           )}
@@ -1422,14 +1446,14 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId }:
             <Group x={0} y={-450}>
               <Rect width={250} height={40} fill="rgba(0,0,0,0.5)" cornerRadius={20} x={-125} />
               <Text 
-                text={`玩家 2 手牌: ${gameState.players[gameState.seats[1]].hand.length} | 英雄: ${gameState.tableCards.filter(c => c.type === 'hero' && Math.abs(c.y - -700) < 100).length}`} 
+                text={`玩家 2 手牌: ${gameState.players[gameState.seats[1]].hand.length} | 英雄: ${gameState.tableCards.filter(c => c.type === 'hero' && Math.abs(c.y - -700) < 100).length} | 王城血量: ${gameState.castleHP[1] || 0}`} 
                 fill="white" 
-                width={250} 
+                width={300} 
                 align="center" 
                 y={12} 
                 fontSize={16} 
                 fontStyle="bold" 
-                x={-125}
+                x={-150}
               />
             </Group>
           )}
@@ -1502,6 +1526,8 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId }:
                 token={token} 
                 socket={socket} 
                 onClick={handleTokenClick}
+                onHexClick={handleHexClick}
+                isMyToken={isMyToken}
                 isSelected={isSelected}
                 draggable={!gameState.gameStarted || (!gameState.selectedOption && !gameState.selectedTokenId && isMyToken)}
                 lastEvolvedId={gameState.lastEvolvedId}
@@ -1513,7 +1539,7 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId }:
             <CounterNode key={counter.id} counter={counter} socket={socket} />
           ))}
 
-          <HistoryLogGroup logs={gameState.logs || []} />
+          <HistoryLogGroup logs={gameState.logs || []} isVisible={isHistoryVisible} position={historyPos} onDragEnd={setHistoryPos} />
         </Layer>
       </Stage>
 

@@ -11,6 +11,7 @@ export default function App() {
   const [gameState, setGameState] = useState<GameState | null>(null);
   const [playerId, setPlayerId] = useState<string>('');
   const [zoomedCard, setZoomedCard] = useState<Card | null>(null);
+  const [isHistoryVisible, setIsHistoryVisible] = useState(true);
 
   useEffect(() => {
     // Connect to the same host that serves the page
@@ -92,11 +93,11 @@ export default function App() {
 
       {/* Main Content */}
       <div className="flex-1 relative">
-        <Tabletop socket={socket} gameState={gameState} setZoomedCard={setZoomedCard} playerId={playerId} />
+        <Tabletop socket={socket} gameState={gameState} setZoomedCard={setZoomedCard} playerId={playerId} isHistoryVisible={isHistoryVisible} />
         
         {/* UI Overlay */}
         <div className="absolute top-4 left-4 pointer-events-none">
-          <Controls socket={socket} />
+          <Controls socket={socket} isHistoryVisible={isHistoryVisible} setIsHistoryVisible={setIsHistoryVisible} />
         </div>
 
         {/* Hand */}

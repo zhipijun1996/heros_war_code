@@ -159,6 +159,7 @@ const createInitialState = (): GameState => {
     selectedTokenId: null,
     remainingMv: 0,
     reachableCells: [],
+    castleHP: { 0: 3, 1: 3 },
     logs: [],
   };
 
@@ -200,6 +201,12 @@ function hexRound(q: number, r: number) {
       rr = -rq - rs;
   }
   return { q: rq, r: rr };
+}
+
+function hexDistance(q1: number, r1: number, q2: number, r2: number) {
+  const s1 = -q1 - r1;
+  const s2 = -q2 - r2;
+  return Math.max(Math.abs(q1 - q2), Math.abs(r1 - r2), Math.abs(s1 - s2));
 }
 
 function pixelToHex(x: number, y: number) {
@@ -296,6 +303,14 @@ const broadcastState = () => {
             });
             if (enemyTokens.length > 0) {
                hasTarget = true;
+            }
+          }
+
+          // 3. Enemy castle
+          if (!hasTarget) {
+            const enemyCastleHex = { q: 0, r: playerIndex === 0 ? -4 : 4 };
+            if (nq === enemyCastleHex.q && nr === enemyCastleHex.r) {
+              hasTarget = true;
             }
           }
           
@@ -451,11 +466,15 @@ const broadcastState = () => {
     proceed_phase: (socket: any) => {
       gameState.lastEvolvedId = null;
       if (gameState.phase === 'supply') {
-        gameState.phase = 'discard';
-        io.emit('state_update', gameState);
-        checkBotTurn();
-      } else if (gameState.phase === 'discard') {
-        gameState.phase = 'end';
+        const needsDiscard = Object.values(gameState.players).some(p => p.hand.length > 5);
+        if (needsDiscard) {
+          gameState.phase = 'discard';
+          addLog(`进入弃牌阶段`, -1);
+        } else {
+          gameState.phase = 'shop';
+          gameState.activePlayerIndex = 1 - gameState.firstPlayerIndex;
+          addLog(`进入商店阶段`, -1);
+        }
         io.emit('state_update', gameState);
         checkBotTurn();
       } else if (gameState.phase === 'end') {
@@ -473,7 +492,7 @@ const broadcastState = () => {
             if (counter.boundToCardId) {
               const heroCard = gameState.tableCards.find(c => c.id === counter.boundToCardId);
               if (heroCard && heroCard.type === 'hero') {
-                if (counter.value >= 2) {
+                if (counter.value >= 1) {
                   countersToRemove.push(counter.id);
                   // Revive hero at capital
                   const token = gameState.tokens.find(t => t.boundToCardId === heroCard.id);
@@ -489,8 +508,11 @@ const broadcastState = () => {
               }
             }
             
-            if (counter.value >= 4) {
+            // Refresh monsters/chests at time = 3
+            if (counter.value >= 3) {
               countersToRemove.push(counter.id);
+              // Refresh logic could go here if implemented
+              gameState.notification = (gameState.notification ? gameState.notification + ' ' : '') + `地图资源已刷新！ (Map resources refreshed!)`;
             }
           }
         });
@@ -522,10 +544,38 @@ const broadcastState = () => {
         gameState.consecutivePasses += 1;
         addLog(`玩家${playerIndex + 1}选择了Pass`, playerIndex);
         if (gameState.consecutivePasses >= 2) {
-          gameState.phase = 'shop';
-          gameState.activePlayerIndex = 1 - gameState.firstPlayerIndex;
+          gameState.phase = 'supply';
           gameState.consecutivePasses = 0;
-          addLog(`进入商店阶段`, -1);
+          addLog(`进入补给阶段`, -1);
+          
+          // Execute supply logic
+          const isHeroAlive = (card: TableCard) => {
+            return !gameState.counters.some(c => c.type === 'time' && c.boundToCardId === card.id);
+          };
+          const p1Heroes = gameState.tableCards.filter(c => c.type === 'hero' && c.y > 0 && isHeroAlive(c)).length;
+          const p2Heroes = gameState.tableCards.filter(c => c.type === 'hero' && c.y < 0 && isHeroAlive(c)).length;
+          
+          const drawCards = (playerSocketId: string, count: number) => {
+            const player = gameState.players[playerSocketId];
+            if (!player) return;
+            for (let i = 0; i < count; i++) {
+              if (gameState.decks.action.length > 0) {
+                player.hand.push(gameState.decks.action.pop()!);
+              } else if (gameState.discardPiles.action.length > 0) {
+                gameState.decks.action = [...gameState.discardPiles.action].sort(() => Math.random() - 0.5);
+                gameState.discardPiles.action = [];
+                if (gameState.decks.action.length > 0) {
+                  player.hand.push(gameState.decks.action.pop()!);
+                }
+              }
+            }
+          };
+          
+          if (gameState.seats[0]) drawCards(gameState.seats[0], p1Heroes + 1);
+          if (gameState.seats[1]) drawCards(gameState.seats[1], p2Heroes + 1);
+
+          gameState.phase = 'supply';
+          addLog(`进入补给阶段`, -1);
         } else {
           gameState.activePlayerIndex = 1 - gameState.activePlayerIndex;
         }
@@ -708,35 +758,9 @@ const broadcastState = () => {
       if (gameState.phase === 'shop' && playerIndex === gameState.activePlayerIndex) {
         gameState.consecutivePasses += 1;
         if (gameState.consecutivePasses >= 2) {
-          gameState.phase = 'supply';
+          gameState.phase = 'end';
           gameState.consecutivePasses = 0;
-          
-          // Execute supply logic
-          const isHeroAlive = (card: TableCard) => {
-            return !gameState.counters.some(c => c.type === 'time' && c.boundToCardId === card.id);
-          };
-          const p1Heroes = gameState.tableCards.filter(c => c.type === 'hero' && c.y > 0 && isHeroAlive(c)).length;
-          const p2Heroes = gameState.tableCards.filter(c => c.type === 'hero' && c.y < 0 && isHeroAlive(c)).length;
-          
-          const drawCards = (playerSocketId: string, count: number) => {
-            const player = gameState.players[playerSocketId];
-            if (!player) return;
-            for (let i = 0; i < count; i++) {
-              if (gameState.decks.action.length > 0) {
-                player.hand.push(gameState.decks.action.pop()!);
-              } else if (gameState.discardPiles.action.length > 0) {
-                gameState.decks.action = [...gameState.discardPiles.action].sort(() => Math.random() - 0.5);
-                gameState.discardPiles.action = [];
-                if (gameState.decks.action.length > 0) {
-                  player.hand.push(gameState.decks.action.pop()!);
-                }
-              }
-            }
-          };
-          
-          if (gameState.seats[0]) drawCards(gameState.seats[0], p1Heroes + 1);
-          if (gameState.seats[1]) drawCards(gameState.seats[1], p2Heroes + 1);
-          
+          addLog(`进入回合结束阶段`, -1);
         } else {
           gameState.activePlayerIndex = 1 - gameState.activePlayerIndex;
         }
@@ -1175,8 +1199,11 @@ const broadcastState = () => {
       
       const allFinished = gameState.seats.filter(id => id !== null).every(id => gameState.players[id!].discardFinished);
       if (allFinished) {
-        gameState.phase = 'end';
-        handlers.proceed_phase(socket);
+        gameState.phase = 'shop';
+        gameState.activePlayerIndex = 1 - gameState.firstPlayerIndex;
+        addLog(`进入商店阶段`, -1);
+        broadcastState();
+        checkBotTurn();
       } else {
         broadcastState();
         checkBotTurn(); // Trigger bots to finish their discard
@@ -1824,7 +1851,7 @@ const broadcastState = () => {
               token.x = pos.x;
               token.y = pos.y;
               gameState.remainingMv! -= dist;
-              
+
               if (gameState.remainingMv! > 0) {
                 gameState.reachableCells = calculateReachableCells(q, r, gameState.remainingMv!, playerIndex);
               } else {
@@ -1906,6 +1933,36 @@ const broadcastState = () => {
               }
             }
             
+            // Attack enemy castle
+            const enemyCastleQ = 0;
+            const enemyCastleR = playerIndex === 0 ? -4 : 4;
+            if (q === enemyCastleQ && r === enemyCastleR) {
+              const enemyUnit = gameState.tokens.find(t => {
+                const hex = pixelToHex(t.x, t.y);
+                return hex.q === q && hex.r === r;
+              });
+              if (!enemyUnit) {
+                const enemyIndex = 1 - playerIndex;
+                gameState.castleHP[enemyIndex] = (gameState.castleHP[enemyIndex] || 3) - 1;
+                gameState.notification = `王城受到攻击！玩家 ${enemyIndex + 1} 的王城 HP 剩余 ${gameState.castleHP[enemyIndex]}。`;
+                
+                if (gameState.castleHP[enemyIndex] <= 0) {
+                  gameState.notification = `游戏结束！玩家 ${playerIndex + 1} 摧毁了敌方王城，获得胜利！`;
+                  gameState.gameStarted = false;
+                }
+                
+                gameState.phase = 'action_play';
+                gameState.selectedOption = null;
+                gameState.selectedTargetId = null;
+                gameState.selectedTokenId = null;
+                gameState.reachableCells = [];
+                gameState.activePlayerIndex = 1 - gameState.activePlayerIndex;
+                broadcastState();
+                checkBotTurn();
+                return;
+              }
+            }
+
             // Attack enemy hero
             const enemyTokens = gameState.tokens.filter(t => {
                const card = gameState.tableCards.find(c => c.id === t.boundToCardId);
@@ -1985,6 +2042,25 @@ const broadcastState = () => {
       const playerIndex = isPlayer1 ? 0 : (isPlayer2 ? 1 : -1);
       
       if (gameState.phase === 'action_defend' && playerIndex === gameState.activePlayerIndex) {
+        const attackerToken = gameState.tokens.find(t => t.id === gameState.selectedTokenId);
+        const defenderCard = gameState.tableCards.find(c => c.id === gameState.selectedTargetId);
+        const defenderToken = gameState.tokens.find(t => t.boundToCardId === gameState.selectedTargetId);
+        
+        if (attackerToken && defenderToken && defenderCard) {
+          const attackerHex = pixelToHex(attackerToken.x, attackerToken.y);
+          const defenderHex = pixelToHex(defenderToken.x, defenderToken.y);
+          const dist = hexDistance(attackerHex.q, attackerHex.r, defenderHex.q, defenderHex.r);
+          
+          const heroData = heroesDatabase?.heroes?.find((h: any) => h.name === defenderCard.heroClass);
+          const levelData = heroData?.levels?.[defenderCard.level || 1];
+          const ar = levelData?.ar || 1;
+          
+          if (dist > ar) {
+            socket.emit('error_message', '攻击者不在反击范围内。 (Attacker is out of counter-attack range.)');
+            return;
+          }
+        }
+
         const hasDefenseCard = gameState.playAreaCards.some(c => c.name === '防御' || c.name === '闪避');
         if (hasDefenseCard) {
           gameState.phase = 'action_resolve_attack_counter';
