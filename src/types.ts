@@ -57,13 +57,19 @@ export interface ImageConfig {
   t3Cards: string[];
 }
 
-export type GamePhase = 'setup' | 'action_play' | 'action_select_option' | 'action_defend' | 'action_resolve_attack' | 'action_resolve_attack_counter' | 'action_resolve_counter' | 'shop' | 'supply' | 'discard' | 'end' | 'action_play_defense' | 'action_play_counter';
+export interface PendingRevival {
+  heroCardId: string;
+  playerIndex: number;
+}
+
+export type GamePhase = 'setup' | 'action_play' | 'action_select_option' | 'action_defend' | 'action_resolve_attack' | 'action_resolve_attack_counter' | 'action_resolve_counter' | 'shop' | 'supply' | 'discard' | 'end' | 'action_play_defense' | 'action_play_counter' | 'revival';
 
 export interface MovementStep {
   tokenId: string;
   fromX: number;
   fromY: number;
   mvCost: number;
+  wasChanting?: boolean;
 }
 
 export interface GameLog {
@@ -72,6 +78,13 @@ export interface GameLog {
   playerIndex: number;
   message: string;
   timestamp: number;
+}
+
+export interface MagicCircle {
+  q: number;
+  r: number;
+  state: 'idle' | 'chanting';
+  chantingTokenId?: string;
 }
 
 export interface GameState {
@@ -95,6 +108,7 @@ export interface GameState {
   counters: Counter[];
   imageConfig?: ImageConfig;
   heroPlayed: Record<string, boolean>;
+  heroPlayedCount: Record<string, number>;
   round: number;
   firstPlayerIndex: number;
   activePlayerIndex: number;
@@ -105,7 +119,9 @@ export interface GameState {
   lastPlayedCardId?: string | null;
   selectedOption?: string | null;
   selectedTargetId?: string | null;
+  selectedHeroCardId?: string | null;
   secondaryCardId?: string | null;
+  selectedHireCost?: number | null;
   hasSeizedInitiative?: boolean;
   canEvolve?: boolean;
   evolvableHeroIds?: string[];
@@ -119,6 +135,10 @@ export interface GameState {
   movementHistory?: MovementStep[];
   canHire?: boolean;
   castleHP: Record<number, number>;
+  reputation: Record<number, number>;
   roundActionCounts: Record<string, number>;
+  globalMovementMovedTokens?: string[];
+  magicCircles: MagicCircle[];
+  pendingRevivals?: PendingRevival[];
   logs: GameLog[];
 }

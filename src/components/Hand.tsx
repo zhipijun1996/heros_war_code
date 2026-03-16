@@ -8,13 +8,19 @@ interface HandProps {
   hand: Card[];
   setZoomedCard: (card: Card | null) => void;
   gameState: GameState;
+  selectedHeroCardId: string | null;
+  setSelectedHeroCardId: (id: string | null) => void;
 }
 
-export default function Hand({ socket, hand, setZoomedCard, gameState }: HandProps) {
+export default function Hand({ socket, hand, setZoomedCard, gameState, selectedHeroCardId, setSelectedHeroCardId }: HandProps) {
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
   const clickTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   const playCard = (cardId: string) => {
+    if (gameState.phase === 'setup') {
+      setSelectedHeroCardId(cardId === selectedHeroCardId ? null : cardId);
+      return;
+    }
     if (gameState.phase === 'discard') {
       socket.emit('error_message', '弃牌阶段无法出牌。');
       return;
@@ -52,20 +58,21 @@ export default function Hand({ socket, hand, setZoomedCard, gameState }: HandPro
       <div className="flex gap-[-20px] pointer-events-auto">
         {hand && hand.map((card, index) => {
           const isHovered = hoveredIndex === index;
+          const isSelected = card.id === selectedHeroCardId;
           
           return (
             <motion.div
               key={card.id}
-              className="relative w-24 h-36 rounded-lg shadow-xl cursor-pointer border border-zinc-700 bg-zinc-800 overflow-hidden"
+              className={`relative w-24 h-36 rounded-lg shadow-xl cursor-pointer border overflow-hidden ${isSelected ? 'border-yellow-400 ring-4 ring-yellow-400/50' : 'border-zinc-700 bg-zinc-800'}`}
               style={{
                 marginLeft: index === 0 ? 0 : -30,
-                zIndex: isHovered ? 10 : index,
+                zIndex: isHovered || isSelected ? 100 : index,
               }}
               initial={{ y: 50, opacity: 0 }}
               animate={{ 
-                y: isHovered ? -20 : 0, 
+                y: isHovered || isSelected ? -20 : 0, 
                 opacity: 1,
-                rotate: isHovered ? 0 : (index - hand.length / 2) * 2
+                rotate: isHovered || isSelected ? 0 : (index - hand.length / 2) * 2
               }}
               onHoverStart={() => setHoveredIndex(index)}
               onHoverEnd={() => setHoveredIndex(null)}

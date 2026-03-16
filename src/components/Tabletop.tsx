@@ -13,9 +13,17 @@ interface TabletopProps {
   setZoomedCard: (card: Card | null) => void;
   playerId: string;
   isHistoryVisible: boolean;
+  selectedHeroCardId: string | null;
+  setSelectedHeroCardId: (id: string | null) => void;
+  selectedHireCardId: string | null;
+  setSelectedHireCardId: (id: string | null) => void;
 }
 
 const HEX_SIZE = 45;
+const CASTLES = {
+  0: [{ q: 0, r: 4 }, { q: 4, r: 0 }],
+  1: [{ q: 0, r: -4 }, { q: -4, r: 0 }]
+};
 
 function pixelToHex(x: number, y: number) {
   const q = (2/3 * x) / HEX_SIZE;
@@ -44,7 +52,7 @@ function hexToPixel(q: number, r: number) {
   return { x, y };
 }
 
-function HexNode({ q, r, x, y, fill, icon, onContextMenu, highlightColor, onClick }: { q: number, r: number, x: number, y: number, fill: string, icon: string, onContextMenu: any, highlightColor?: string, onClick?: (q: number, r: number) => void }) {
+function HexNode({ q, r, x, y, fill, icon, onContextMenu, highlightColor, onClick, magicCircleState }: { q: number, r: number, x: number, y: number, fill: string, icon: string, onContextMenu: any, highlightColor?: string, onClick?: (q: number, r: number) => void, magicCircleState?: string }) {
   const points = [];
   for (let i = 0; i < 6; i++) {
     const angle_deg = 60 * i;
@@ -53,7 +61,7 @@ function HexNode({ q, r, x, y, fill, icon, onContextMenu, highlightColor, onClic
     points.push(y + HEX_SIZE * Math.sin(angle_rad));
   }
 
-  const isSpecial = fill !== "#ffffff";
+  const isSpecial = fill !== "#ffffff" || magicCircleState !== undefined;
   const timerRef = useRef<any>(null);
   const longPressTriggered = useRef(false);
   const touchStartPos = useRef({ x: 0, y: 0 });
@@ -95,6 +103,20 @@ function HexNode({ q, r, x, y, fill, icon, onContextMenu, highlightColor, onClic
     }
   };
 
+  let finalFill = highlightColor || fill;
+  let finalStroke = highlightColor ? (highlightColor.includes('239') ? "#ef4444" : "#facc15") : "#a1a1aa";
+  let finalStrokeWidth = highlightColor ? 4 : 1;
+
+  if (magicCircleState) {
+    if (magicCircleState === 'chanting') {
+      finalFill = "#bfdbfe"; // Highlight blue
+      finalStroke = "#3b82f6";
+      finalStrokeWidth = 4;
+    } else {
+      finalFill = "#e0e7ff"; // Light blue for idle
+    }
+  }
+
   return (
     <Group 
       onContextMenu={(e) => {
@@ -112,9 +134,9 @@ function HexNode({ q, r, x, y, fill, icon, onContextMenu, highlightColor, onClic
     >
       <Line 
         points={points} 
-        fill={highlightColor || fill} 
-        stroke={highlightColor ? (highlightColor.includes('239') ? "#ef4444" : "#facc15") : "#a1a1aa"} 
-        strokeWidth={highlightColor ? 4 : 1} 
+        fill={finalFill} 
+        stroke={finalStroke} 
+        strokeWidth={finalStrokeWidth} 
         closed 
       />
       {icon && <Text x={x - HEX_SIZE/2} y={y - 12} width={HEX_SIZE} text={icon} fontSize={24} align="center" />}
@@ -122,7 +144,7 @@ function HexNode({ q, r, x, y, fill, icon, onContextMenu, highlightColor, onClic
   );
 }
 
-function HexGridLayer({ onHexContextMenu, reachableCells, onHexClick, selectedOption }: { onHexContextMenu: (e: any, x: number, y: number, clientX?: number, clientY?: number) => void, reachableCells?: { q: number, r: number }[], onHexClick?: (q: number, r: number) => void, selectedOption?: string | null }) {
+function HexGridLayer({ onHexContextMenu, reachableCells, onHexClick, selectedOption, magicCircles, selectedHeroCardId, selectedHireCardId, playerIndex, phase, pendingRevivals }: { onHexContextMenu: (e: any, x: number, y: number, clientX?: number, clientY?: number) => void, reachableCells?: { q: number, r: number }[], onHexClick?: (q: number, r: number) => void, selectedOption?: string | null, magicCircles?: { q: number, r: number, state: string }[], selectedHeroCardId?: string | null, selectedHireCardId?: string | null, playerIndex: number, phase?: string, pendingRevivals?: any[] }) {
   const hexes = [];
   const radius = 4;
   
@@ -136,17 +158,36 @@ function HexGridLayer({ onHexContextMenu, reachableCells, onHexClick, selectedOp
       let fill = "#ffffff";
       let icon = "";
       
-      if (q === 0 && r === 0) { fill = "#bfdbfe"; icon = "💎"; } // Crystal
-      else if ((q === 0 && r === 4) || (q === 0 && r === -4)) { fill = "#d4d4d8"; icon = "🏰"; } // Castle
+      const magicCircle = magicCircles?.find(mc => mc.q === q && mc.r === r);
+      if (magicCircle) {
+        icon = "✨";
+      } else if (q === 0 && r === 0) { fill = "#bfdbfe"; icon = "💎"; } // Crystal
+      else if ((q === 0 && r === 4) || (q === 4 && r === 0)) { fill = "#fee2e2"; icon = "🏰"; } // P1 Castle
+      else if ((q === 0 && r === -4) || (q === -4 && r === 0)) { fill = "#dcfce7"; icon = "🏰"; } // P2 Castle
       else if ((q === -1 && r === 3) || (q === 1 && r === -3)) { fill = "#fef08a"; icon = "📦"; } // T1
       else if ((q === 1 && r === 1) || (q === -1 && r === -1)) { fill = "#fde68a"; icon = "👑"; } // T2
       else if ((q === -2 && r === 4) || (q === 2 && r === 2) || (q === -2 && r === -2) || (q === 2 && r === -4)) { fill = "#fbcfe8"; icon = "👾"; } // M1
-      else if ((q === -3 && r === 3) || (q === -1 && r === 1) || (q === 3 && r === -3) || (q === 1 && r === -1)) { fill = "#f87171"; icon = "💀"; } // M2
-      else if ((q === -3 && r === 1) || (q === 3 && r === -1)) { fill = "#fca5a5"; icon = "🐉"; } // M3
+      else if ((q === -3 && r === 1) || (q === -1 && r === 1) || (q === 3 && r === -1) || (q === 1 && r === -1)) { fill = "#f87171"; icon = "💀"; } // M2
+      else if ((q === -3 && r === 3) || (q === 3 && r === -3)) { fill = "#fca5a5"; icon = "🐉"; } // M3
       
       const isReachable = reachableCells?.some(c => c.q === q && c.r === r);
       const isAttack = selectedOption === 'attack' || selectedOption === 'heavy_strike';
-      const highlightColor = isReachable ? (isAttack ? "rgba(239, 68, 68, 0.4)" : "rgba(253, 224, 71, 0.4)") : undefined;
+      let highlightColor = isReachable ? (isAttack ? "rgba(239, 68, 68, 0.4)" : "rgba(253, 224, 71, 0.4)") : undefined;
+
+      // Highlight castles for deployment/hiring/revival
+      const isCastle = (q === 0 && r === 4) || (q === 4 && r === 0) || (q === 0 && r === -4) || (q === -4 && r === 0);
+      if (isCastle) {
+        const playerCastles = CASTLES[playerIndex as 0 | 1];
+        const isMyCastle = playerCastles?.some(c => c.q === q && c.r === r);
+        
+        if (isMyCastle) {
+          if (selectedHeroCardId || selectedHireCardId || selectedOption === 'hire') {
+            highlightColor = "rgba(168, 85, 247, 0.4)"; // Purple highlight
+          } else if (phase === 'revival' && pendingRevivals?.some(r => r.playerIndex === playerIndex)) {
+            highlightColor = "rgba(139, 92, 246, 0.6)"; // Violet highlight
+          }
+        }
+      }
 
       hexes.push(
         <HexNode 
@@ -160,6 +201,7 @@ function HexGridLayer({ onHexContextMenu, reachableCells, onHexClick, selectedOp
           onContextMenu={onHexContextMenu} 
           highlightColor={highlightColor}
           onClick={onHexClick}
+          magicCircleState={magicCircle?.state}
         />
       );
     }
@@ -563,7 +605,7 @@ function HistoryLogGroup({ logs, isVisible, position, onDragEnd }: { logs: GameL
   );
 }
 
-export default function Tabletop({ socket, gameState, setZoomedCard, playerId, isHistoryVisible }: TabletopProps) {
+export default function Tabletop({ socket, gameState, setZoomedCard, playerId, isHistoryVisible, selectedHeroCardId, setSelectedHeroCardId, selectedHireCardId, setSelectedHireCardId }: TabletopProps) {
   const containerRef = useRef<HTMLDivElement>(null);
 
   const calculateInitialScale = (w: number, h: number) => {
@@ -780,9 +822,13 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId, i
 
   const getPromptText = () => {
     if (gameState.phase === 'setup') {
-      if (playerIndex !== -1 && !gameState.heroPlayed[playerId]) {
-        return "准备阶段：请选择初始英雄（其他英雄将进入雇佣区）";
-      } else if (playerIndex !== -1 && gameState.heroPlayed[playerId]) {
+      const playedCount = gameState.heroPlayedCount[playerId] || 0;
+      if (playerIndex !== -1 && playedCount < 2) {
+        if (selectedHeroCardId) {
+          return "准备阶段：请点击地图上的王城🏰以部署英雄";
+        }
+        return `准备阶段：请从手牌选择第 ${playedCount + 1} 个初始英雄`;
+      } else if (playerIndex !== -1 && playedCount >= 2) {
         return "准备阶段：等待对手选择初始英雄";
       }
       return "准备阶段：等待双方选择初始英雄";
@@ -834,15 +880,24 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId, i
           return `已选择英雄，请点击高亮的攻击目标 (Hero selected, click a highlighted target)`;
         }
         return `攻击：请选择一个己方英雄 (Attack: Select a hero)`;
+      } else if (gameState.selectedOption === 'hire') {
+        if (gameState.selectedTargetId && gameState.selectedHireCost) {
+          return "请点击地图上的王城🏰以部署雇佣的英雄";
+        }
+        return `雇佣：请选择一个英雄并支付金币 (Hire: Select a hero and pay gold)`;
+      } else if (gameState.selectedOption === 'chant') {
+        return `咏唱：请选择在魔法阵上的己方英雄 (Chant: Select a hero on a magic circle)`;
+      } else if (gameState.selectedOption === 'fire') {
+        return `开火：请选择正在咏唱的己方英雄 (Fire: Select a chanting hero)`;
       }
       return `结算阶段：请${activePlayerStr}结算场面`;
     }
     if (gameState.phase === 'action_defend') {
       const hasDefenseCard = gameState.playAreaCards.some(c => c.name === '防御' || c.name === '闪避');
       if (hasDefenseCard) {
-        return `防御阶段：请${activePlayerStr}选择防御或反击 (Choose Defend or Counter)`;
+        return `防御阶段：已打出防御卡，请选择确认防御或反击 (Defense card played, choose Confirm or Counter)`;
       }
-      return `防御阶段：请${activePlayerStr}打出防御卡（或Pass） (Play a defense card or Pass)`;
+      return `防御阶段：请${activePlayerStr}打出防御卡或Pass (Play a defense card or Pass)`;
     }
     if (gameState.phase === 'action_resolve_attack') {
       return `攻击结算：请${activePlayerStr}结算攻击`;
@@ -854,7 +909,20 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId, i
       return `反击结算：请${activePlayerStr}结算反击 (Settle counter-attack)`;
     }
     if (gameState.phase === 'shop') {
+      if ((selectedHireCardId || gameState.selectedTargetId) && gameState.selectedHireCost) {
+        return "请点击地图上的王城🏰以部署雇佣的英雄";
+      } else if (selectedHireCardId || gameState.selectedTargetId) {
+        return "请选择雇佣成本 (Select hire cost)";
+      }
       return `商店阶段：请${activePlayerStr}购买装备或雇佣英雄`;
+    }
+    if (gameState.phase === 'revival') {
+      const pending = gameState.pendingRevivals?.find(r => r.playerIndex === playerIndex);
+      if (pending) {
+        const hero = gameState.tableCards.find(c => c.id === pending.heroCardId);
+        return `复活阶段：请点击地图上的王城🏰以复活 ${hero?.heroClass || '英雄'}`;
+      }
+      return `复活阶段：等待对方复活英雄...`;
     }
     if (gameState.phase === 'supply') {
       return `补给阶段：双方抽取卡牌（英雄数+1）`;
@@ -924,6 +992,20 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId, i
             <button onClick={() => socket.emit('select_option', 'buy')} className="px-4 py-2 bg-amber-600 hover:bg-amber-500 text-white rounded-lg font-bold">
               购买
             </button>
+            {gameState.tokens.some(t => {
+              const c = gameState.tableCards.find(tc => tc.id === t.boundToCardId);
+              const isMine = c && ((gameState.seats[0] === playerId && c.y > 0) || (gameState.seats[1] === playerId && c.y < 0));
+              if (!isMine) return false;
+              const isAlive = !gameState.counters.some(counter => counter.type === 'time' && counter.boundToCardId === t.boundToCardId);
+              if (!isAlive) return false;
+              const hex = pixelToHex(t.x, t.y);
+              const mc = gameState.magicCircles?.find(m => m.q === hex.q && m.r === hex.r);
+              return mc && mc.state === 'idle';
+            }) && (
+              <button onClick={() => socket.emit('select_option', 'chant')} className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg font-bold">
+                咏唱
+              </button>
+            )}
             
             {playedCard && playedCard.type === 'action' && playedCard.name !== '防御' && (
               <>
@@ -954,6 +1036,20 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId, i
                     <button onClick={() => socket.emit('select_option', 'skill')} className="px-4 py-2 bg-purple-600 hover:bg-purple-500 text-white rounded-lg font-bold">
                       技能
                     </button>
+                    {gameState.tokens.some(t => {
+                      const c = gameState.tableCards.find(tc => tc.id === t.boundToCardId);
+                      const isMine = c && ((gameState.seats[0] === playerId && c.y > 0) || (gameState.seats[1] === playerId && c.y < 0));
+                      if (!isMine) return false;
+                      const isAlive = !gameState.counters.some(counter => counter.type === 'time' && counter.boundToCardId === t.boundToCardId);
+                      if (!isAlive) return false;
+                      const hex = pixelToHex(t.x, t.y);
+                      const mc = gameState.magicCircles?.find(m => m.q === hex.q && m.r === hex.r);
+                      return mc && mc.state === 'chanting' && mc.chantingTokenId === t.id;
+                    }) && (
+                      <button onClick={() => socket.emit('select_option', 'fire')} className="px-4 py-2 bg-orange-600 hover:bg-orange-500 text-white rounded-lg font-bold">
+                        开火
+                      </button>
+                    )}
                   </>
                 )}
               </>
@@ -1009,8 +1105,8 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId, i
               {[2, 3, 4, 5, 6, 7, 8, 9].map(cost => (
                 <button 
                   key={cost}
-                  onClick={() => socket.emit('hire_hero', { cardId: gameState.selectedTargetId, goldAmount: cost })}
-                  className={`px-4 py-2 rounded-lg font-bold ${gameState.selectedTargetId ? 'bg-emerald-600 hover:bg-emerald-500 text-white' : 'bg-zinc-800 text-zinc-500 cursor-not-allowed'}`}
+                  onClick={() => socket.emit('select_hire_cost', cost)}
+                  className={`px-4 py-2 rounded-lg font-bold transition-all ${!gameState.selectedTargetId ? 'bg-zinc-800 text-zinc-500 cursor-not-allowed' : gameState.selectedHireCost === cost ? 'bg-emerald-500 text-white scale-110 shadow-lg shadow-emerald-500/50' : 'bg-emerald-900/50 text-emerald-200 hover:bg-emerald-800'}`}
                   disabled={!gameState.selectedTargetId}
                 >
                   {cost} 金币
@@ -1050,6 +1146,19 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId, i
                 className={`px-4 py-2 rounded-lg font-bold ${gameState.selectedTargetId ? 'bg-emerald-600 hover:bg-emerald-500 text-white' : 'bg-zinc-800 text-zinc-500 cursor-not-allowed'}`}
               >
                 确定回复
+              </button>
+            </div>
+          </div>
+        );
+      } else if (gameState.selectedOption === 'chant' || gameState.selectedOption === 'fire') {
+        return (
+          <div className="flex flex-col gap-4 items-center">
+            <div className="text-white font-bold mb-2 bg-black/40 px-4 py-2 rounded-full backdrop-blur-sm">
+              {gameState.selectedOption === 'chant' ? '请选择在魔法阵上的己方英雄 (Select your hero on a magic circle)' : '请选择正在咏唱的己方英雄 (Select your chanting hero)'}
+            </div>
+            <div className="flex gap-4">
+              <button onClick={() => socket.emit('undo_play')} className="px-4 py-2 bg-zinc-600 hover:bg-zinc-500 text-white rounded-lg font-bold">
+                撤回
               </button>
             </div>
           </div>
@@ -1095,23 +1204,28 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId, i
     }
     if (gameState.phase === 'action_defend') {
       const hasDefenseCard = gameState.playAreaCards.some(c => c.name === '防御' || c.name === '闪避');
+      if (hasDefenseCard) {
+        return (
+          <div className="flex gap-4">
+            <button onClick={() => socket.emit('declare_defend')} className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg font-bold">
+              确认防御
+            </button>
+            <button onClick={() => socket.emit('declare_counter')} className="px-4 py-2 bg-orange-600 hover:bg-orange-500 text-white rounded-lg font-bold">
+              确认反击
+            </button>
+            <button onClick={() => socket.emit('undo_play')} className="px-4 py-2 bg-zinc-600 hover:bg-zinc-500 text-white rounded-lg font-bold">
+              撤回
+            </button>
+          </div>
+        );
+      }
       return (
         <div className="flex gap-4">
-          {hasDefenseCard && (
-            <>
-              <button onClick={() => socket.emit('declare_defend')} className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg font-bold">
-                防御
-              </button>
-              <button onClick={() => socket.emit('declare_counter')} className="px-4 py-2 bg-orange-600 hover:bg-orange-500 text-white rounded-lg font-bold">
-                反击
-              </button>
-            </>
-          )}
+          <button onClick={() => socket.emit('declare_defend')} className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg font-bold">
+            防御
+          </button>
           <button onClick={() => socket.emit('pass_defend')} className="px-4 py-2 bg-zinc-700 hover:bg-zinc-600 text-white rounded-lg font-bold">
             Pass
-          </button>
-          <button onClick={() => socket.emit('undo_play')} className="px-4 py-2 bg-zinc-600 hover:bg-zinc-500 text-white rounded-lg font-bold">
-            撤回
           </button>
         </div>
       );
@@ -1145,6 +1259,32 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId, i
       );
     }
     if (gameState.phase === 'shop') {
+      if (gameState.selectedOption === 'hire') {
+        const goldY = isPlayer1 ? 550 : -700;
+        const goldCounter = gameState.counters.find(c => c.type === 'gold' && Math.abs(c.y - goldY) < 100);
+        const maxGold = goldCounter ? goldCounter.value : 0;
+        const costs = [2, 3, 4, 5].filter(c => c <= maxGold);
+
+        return (
+          <div className="flex flex-col gap-4 items-center">
+            <div className="text-white font-bold">请选择雇佣成本 (Select hire cost)</div>
+            <div className="flex gap-2">
+              {costs.map(cost => (
+                <button 
+                  key={cost} 
+                  onClick={() => socket.emit('select_hire_cost', cost)}
+                  className={`px-4 py-2 rounded-lg font-bold transition-all ${gameState.selectedHireCost === cost ? 'bg-pink-500 text-white scale-110 shadow-lg shadow-pink-500/50' : 'bg-pink-900/50 text-pink-200 hover:bg-pink-800'}`}
+                >
+                  {cost} 金币
+                </button>
+              ))}
+            </div>
+            <button onClick={() => socket.emit('select_option', null)} className="px-4 py-2 bg-zinc-600 hover:bg-zinc-500 text-white rounded-lg font-bold">
+              取消 (Cancel)
+            </button>
+          </div>
+        );
+      }
       return (
         <div className="flex gap-4">
           <button onClick={() => socket.emit('select_option', 'buy')} className="px-4 py-2 bg-amber-600 hover:bg-amber-500 text-white rounded-lg font-bold">
@@ -1204,6 +1344,46 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId, i
   };
 
   const handleHexClick = (q: number, r: number) => {
+    if (gameState.phase === 'setup' && isActivePlayer) {
+      if (selectedHeroCardId) {
+        const playerCastles = CASTLES[playerIndex as 0 | 1];
+        const castleIdx = playerCastles.findIndex(c => c.q === q && c.r === r);
+        if (castleIdx !== -1) {
+          socket.emit('play_card', { cardId: selectedHeroCardId, targetCastleIndex: castleIdx });
+          setSelectedHeroCardId(null);
+        }
+      }
+      return;
+    }
+
+    if ((gameState.phase === 'shop' || gameState.phase === 'action_select_option') && isActivePlayer) {
+      if ((gameState.phase === 'shop' && (selectedHireCardId || gameState.selectedTargetId) && gameState.selectedHireCost) || 
+          (gameState.phase === 'action_select_option' && gameState.selectedOption === 'hire' && gameState.selectedTargetId && gameState.selectedHireCost)) {
+        const playerCastles = CASTLES[playerIndex as 0 | 1];
+        const castleIdx = playerCastles.findIndex(c => c.q === q && c.r === r);
+        if (castleIdx !== -1) {
+          const hireCardId = selectedHireCardId || gameState.selectedTargetId;
+          const goldAmount = gameState.selectedHireCost;
+          socket.emit('hire_hero', { cardId: hireCardId, goldAmount, targetCastleIndex: castleIdx });
+          if (gameState.phase === 'shop') setSelectedHireCardId(null);
+          return;
+        }
+      }
+      if (gameState.phase === 'shop') return;
+    }
+
+    if (gameState.phase === 'revival' && isActivePlayer) {
+      const pending = gameState.pendingRevivals?.find(r => r.playerIndex === playerIndex);
+      if (pending) {
+        const playerCastles = CASTLES[playerIndex as 0 | 1];
+        const castleIdx = playerCastles.findIndex(c => c.q === q && c.r === r);
+        if (castleIdx !== -1) {
+          socket.emit('revive_hero', { heroCardId: pending.heroCardId, targetCastleIndex: castleIdx });
+        }
+      }
+      return;
+    }
+
     if (gameState.phase === 'action_select_option' && isActivePlayer && gameState.selectedTokenId) {
       socket.emit('move_token_to_cell', { q, r });
     }
@@ -1211,7 +1391,7 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId, i
 
   const handleTokenClick = (id: string) => {
     if (gameState.phase === 'action_select_option' && isActivePlayer) {
-      if (gameState.selectedOption === 'move' || gameState.selectedOption === 'sprint' || gameState.selectedOption === 'attack' || gameState.selectedOption === 'heavy_strike') {
+      if (gameState.selectedOption === 'move' || gameState.selectedOption === 'sprint' || gameState.selectedOption === 'attack' || gameState.selectedOption === 'heavy_strike' || gameState.selectedOption === 'chant' || gameState.selectedOption === 'fire') {
         socket.emit('select_token', id);
       }
     }
@@ -1405,6 +1585,12 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId, i
           reachableCells={gameState.reachableCells}
           onHexClick={handleHexClick}
           selectedOption={gameState.selectedOption}
+          magicCircles={gameState.magicCircles}
+          selectedHeroCardId={selectedHeroCardId}
+          selectedHireCardId={selectedHireCardId}
+          playerIndex={playerIndex}
+          phase={gameState.phase}
+          pendingRevivals={gameState.pendingRevivals}
         />
         
         <Layer>
@@ -1445,7 +1631,7 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId, i
             <Group x={0} y={450}>
               <Rect width={250} height={40} fill="rgba(0,0,0,0.5)" cornerRadius={20} x={-125} />
               <Text 
-                text={`玩家 1 手牌: ${gameState.players[gameState.seats[0]].hand.length} | 英雄: ${gameState.tableCards.filter(c => c.type === 'hero' && Math.abs(c.y - 550) < 100).length} | 王城血量: ${gameState.castleHP[0] || 0}`} 
+                text={`玩家 1 手牌: ${gameState.players[gameState.seats[0]].hand.length} | 英雄: ${gameState.tableCards.filter(c => c.type === 'hero' && Math.abs(c.y - 550) < 100).length} | 王城血量: ${gameState.castleHP[0] || 0} | 声望: ${gameState.reputation[0] || 0}`} 
                 fill="white" 
                 width={300} 
                 align="center" 
@@ -1460,7 +1646,7 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId, i
             <Group x={0} y={-450}>
               <Rect width={250} height={40} fill="rgba(0,0,0,0.5)" cornerRadius={20} x={-125} />
               <Text 
-                text={`玩家 2 手牌: ${gameState.players[gameState.seats[1]].hand.length} | 英雄: ${gameState.tableCards.filter(c => c.type === 'hero' && Math.abs(c.y - -700) < 100).length} | 王城血量: ${gameState.castleHP[1] || 0}`} 
+                text={`玩家 2 手牌: ${gameState.players[gameState.seats[1]].hand.length} | 英雄: ${gameState.tableCards.filter(c => c.type === 'hero' && Math.abs(c.y - -700) < 100).length} | 王城血量: ${gameState.castleHP[1] || 0} | 声望: ${gameState.reputation[1] || 0}`} 
                 fill="white" 
                 width={300} 
                 align="center" 
@@ -1497,11 +1683,17 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId, i
               onContextMenu={handleCardContextMenu} 
               onZoom={setZoomedCard} 
               onClick={(id) => {
-                if (gameState.phase === 'action_select_option' && isActivePlayer) {
+                if (gameState.phase === 'shop' && isActivePlayer) {
+                  if (gameState.selectedOption === 'hire') {
+                    socket.emit('select_target', id);
+                  } else {
+                    setSelectedHireCardId(id === selectedHireCardId ? null : id);
+                  }
+                } else if (gameState.phase === 'action_select_option' && isActivePlayer) {
                   socket.emit('select_target', id);
                 }
               }}
-              isSelected={gameState.selectedTargetId === card.id}
+              isSelected={gameState.selectedTargetId === card.id || selectedHireCardId === card.id}
               lastEvolvedId={gameState.lastEvolvedId}
             />
           ))}
@@ -1657,7 +1849,9 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId, i
                   key={amount}
                   className="bg-zinc-800 hover:bg-emerald-600 text-white font-bold py-3 rounded-lg border border-zinc-700 hover:border-emerald-500 transition-colors"
                   onClick={() => {
-                    socket.emit('hire_hero', { cardId: hirePopup.cardId, goldAmount: amount });
+                    socket.emit('select_option', 'hire');
+                    socket.emit('select_target', hirePopup.cardId);
+                    socket.emit('select_hire_cost', amount);
                     setHirePopup(null);
                   }}
                 >

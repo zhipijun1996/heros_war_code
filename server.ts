@@ -9,11 +9,35 @@ import type { GameState, Card, TableCard, Token, Counter, Player, ImageConfig } 
 let heroesDatabase: any = null;
 async function fetchHeroesDatabase() {
   try {
-    const response = await fetch('https://raw.githubusercontent.com/zhipijun1996/heros_war/main/heroes.json');
+    // Add cache-buster to ensure we get the latest version from GitHub
+    const cacheBuster = `?t=${Date.now()}`;
+    const url = `https://raw.githubusercontent.com/zhipijun1996/heros_war/main/heroes.json${cacheBuster}`;
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
     heroesDatabase = await response.json();
-    console.log('Heroes database loaded');
+    
+    // Sanitize data: Fix null XP values that cause immediate evolution
+    // (Keeping this as a safety measure in case GitHub still has nulls)
+    if (heroesDatabase && Array.isArray(heroesDatabase.heroes)) {
+      heroesDatabase.heroes.forEach((hero: any) => {
+        if (hero.levels) {
+          Object.keys(hero.levels).forEach(level => {
+            const levelData = hero.levels[level];
+            if (levelData.xp === null) {
+              if (level === '1') levelData.xp = 2;
+              else if (level === '2') levelData.xp = 4;
+              else levelData.xp = 0;
+            }
+          });
+        }
+      });
+    }
+
+    console.log(`Heroes database loaded from GitHub (URL: ${url})`);
   } catch (e) {
-    console.error('Failed to load heroes database', e);
+    console.error('Failed to load heroes database from GitHub', e);
   }
 }
 fetchHeroesDatabase();
@@ -86,9 +110,14 @@ const ACTION_CARDS_CONFIG = [
 
 const MONSTER_CELLS = [
   { q: -2, r: 4 }, { q: 2, r: 2 }, { q: -2, r: -2 }, { q: 2, r: -4 }, // M1
-  { q: -3, r: 3 }, { q: -1, r: 1 }, { q: 3, r: -3 }, { q: 1, r: -1 }, // M2
-  { q: -3, r: 1 }, { q: 3, r: -1 } // M3
+  { q: -3, r: 1 }, { q: -1, r: 1 }, { q: 3, r: -1 }, { q: 1, r: -1 }, // M2
+  { q: -3, r: 3 }, { q: 3, r: -3 } // M3
 ];
+
+const CASTLES = {
+  0: [{ q: 0, r: 4 }, { q: 4, r: 0 }],
+  1: [{ q: 0, r: -4 }, { q: -4, r: 0 }]
+};
 
 const CHEST_HEXES = [
   { q: 0, r: 0 }, { q: -4, r: 2 }, { q: 4, r: -2 }, { q: -4, r: 4 }, { q: 4, r: -4 }
@@ -165,17 +194,26 @@ const createInitialState = (): GameState => {
       heroTokens: [], heroCards: [], actionCards: [], t1Cards: [], t2Cards: [], t3Cards: []
     },
     heroPlayed: {},
+    heroPlayedCount: {},
     round: 1,
     firstPlayerIndex: 0,
     activePlayerIndex: 0,
     phase: 'setup',
     consecutivePasses: 0,
     selectedOption: null,
+    selectedTargetId: null,
+    selectedHireCost: null,
     selectedTokenId: null,
     remainingMv: 0,
     reachableCells: [],
     castleHP: { 0: 3, 1: 3 },
+    reputation: { 0: 0, 1: 0 },
     roundActionCounts: {},
+    magicCircles: [
+      { q: 2, r: -2, state: 'idle' },
+      { q: -2, r: 2, state: 'idle' }
+    ],
+    pendingRevivals: [],
     logs: [],
   };
 
@@ -269,19 +307,97 @@ async function startServer() {
     return levelData?.hp || 3;
   };
 
-  const addLog = (message: string, playerIndex: number = -1) => {
-  const log: any = {
-    id: generateId(),
-    round: gameState.round,
-    playerIndex,
-    message,
-    timestamp: Date.now()
-  };
-  gameState.logs.push(log);
-  if (gameState.logs.length > 100) {
-    gameState.logs.shift();
+  function isHexInEnemyAttackRange(q: number, r: number, enemyPlayerIndex: number, gameState: GameState) {
+    const enemyTokens = gameState.tokens.filter(t => {
+      const c = gameState.tableCards.find(tc => tc.id === t.boundToCardId);
+      if (!c) return false;
+      // Player 1 (index 0) is at y > 0, Player 2 (index 1) is at y < 0
+      const isEnemy = enemyPlayerIndex === 0 ? c.y > 0 : c.y < 0;
+      const isAlive = !gameState.counters.some(counter => counter.type === 'time' && counter.boundToCardId === t.boundToCardId);
+      return isEnemy && isAlive;
+    });
+
+    for (const t of enemyTokens) {
+      const c = gameState.tableCards.find(tc => tc.id === t.boundToCardId);
+      if (!c) continue;
+      const ar = getHeroAR(c.heroClass!, c.level);
+      const th = pixelToHex(t.x, t.y);
+      const dist = hexDistance(th.q, th.r, q, r);
+      if (dist <= ar) return true;
+    }
+    return false;
   }
-};
+
+  function getRecoilHex(tokenHex: { q: number, r: number }, enemyCastleHex: { q: number, r: number }, gameState: GameState): { q: number, r: number } {
+    const hexDirections = [
+      { q: 1, r: 0 }, { q: 1, r: -1 }, { q: 0, r: -1 },
+      { q: -1, r: 0 }, { q: -1, r: 1 }, { q: 0, r: 1 }
+    ];
+
+    let currentHex = { ...tokenHex };
+    for (let i = 0; i < 2; i++) {
+      let bestHex = null;
+      let maxDist = hexDistance(currentHex.q, currentHex.r, enemyCastleHex.q, enemyCastleHex.r);
+
+      for (const dir of hexDirections) {
+        const neighbor = { q: currentHex.q + dir.q, r: currentHex.r + dir.r };
+        
+        // Check obstacles
+        const isOccupied = gameState.tokens.some(t => {
+          const h = pixelToHex(t.x, t.y);
+          return h.q === neighbor.q && h.r === neighbor.r;
+        });
+        
+        const isMonster = MONSTER_HEXES.some(m => {
+          if (m.q !== neighbor.q || m.r !== neighbor.r) return false;
+          const pos = hexToPixel(m.q, m.r);
+          const hasTimer = gameState.counters.some(c => c.type === 'time' && Math.abs(c.x - pos.x) < 10 && Math.abs(c.y - pos.y) < 10);
+          return !hasTimer;
+        });
+
+        if (!isOccupied && !isMonster) {
+          const dist = hexDistance(neighbor.q, neighbor.r, enemyCastleHex.q, enemyCastleHex.r);
+          if (dist > maxDist) {
+            maxDist = dist;
+            bestHex = neighbor;
+          }
+        }
+      }
+
+      if (bestHex) {
+        currentHex = bestHex;
+      } else {
+        break; // Hit obstacle or no way to move further away
+      }
+    }
+    return currentHex;
+  }
+
+  const addLog = (message: string, playerIndex: number = -1) => {
+    const log: any = {
+      id: generateId(),
+      round: gameState.round,
+      playerIndex,
+      message,
+      timestamp: Date.now()
+    };
+    gameState.logs.push(log);
+    if (gameState.logs.length > 100) {
+      gameState.logs.shift();
+    }
+  };
+
+  const addReputation = (playerIndex: number, amount: number, reason: string) => {
+    if (playerIndex < 0 || playerIndex > 1 || !gameState.gameStarted) return;
+    gameState.reputation[playerIndex] = (gameState.reputation[playerIndex] || 0) + amount;
+    addLog(`声望奖励: 玩家${playerIndex + 1} 获得 ${amount} 点声望 (${reason})，当前声望: ${gameState.reputation[playerIndex]}`, playerIndex);
+    
+    if (gameState.reputation[playerIndex] >= 15) {
+      gameState.notification = `游戏结束！玩家 ${playerIndex + 1} 声望达到 15，获得胜利！`;
+      gameState.gameStarted = false;
+      addLog(`胜利阶段: 玩家${playerIndex + 1} 达成声望胜利！`, playerIndex);
+    }
+  };
 
 const broadcastState = () => {
     io.emit('state_update', gameState);
@@ -412,7 +528,7 @@ const broadcastState = () => {
           const levelData = heroData?.levels?.[hero.level.toString()];
           const expNeeded = levelData?.xp;
           const expCounter = gameState.counters.find(c => c.type === 'exp' && c.boundToCardId === hero.id);
-          if (expCounter && expCounter.value >= expNeeded) {
+          if (expCounter && typeof expNeeded === 'number' && expNeeded > 0 && expCounter.value >= expNeeded) {
             evolvableHeroIds.push(hero.id);
           }
         }
@@ -429,11 +545,14 @@ const broadcastState = () => {
     const goldCounter = gameState.counters.find(c => c.type === 'gold' && (isPlayer1 ? (c.x === -150 && c.y === 550) : (c.x === -150 && c.y === -700)));
     const totalHeroes = playerHeroes.length;
     
-    // Check if castle is occupied
-    const castlePos = hexToPixel(0, isPlayer1 ? 4 : -4);
-    const castleOccupied = gameState.tokens.some(t => Math.abs(t.x - castlePos.x) < 10 && Math.abs(t.y - castlePos.y) < 10);
+    // Check if any castle is free
+    const playerCastles = CASTLES[playerIndex as 0 | 1];
+    const anyCastleFree = playerCastles.some(cPos => {
+      const pos = hexToPixel(cPos.q, cPos.r);
+      return !gameState.tokens.some(t => Math.abs(t.x - pos.x) < 10 && Math.abs(t.y - pos.y) < 10);
+    });
     
-    gameState.canHire = (goldCounter && goldCounter.value >= 2 && gameState.hireAreaCards.length > 0 && totalHeroes < 4 && !castleOccupied);
+    gameState.canHire = (goldCounter && goldCounter.value >= 2 && gameState.hireAreaCards.length > 0 && totalHeroes < 4 && anyCastleFree);
 
     // Check chest condition
     const playerTokens = gameState.tokens.filter(t => {
@@ -452,6 +571,12 @@ const broadcastState = () => {
 
     const phase = gameState.phase;
     console.log(`checkBotTurn: phase=${phase}, activePlayerIndex=${gameState.activePlayerIndex}`);
+    
+    // Log token coordinates
+    gameState.tokens.forEach(t => {
+      const card = gameState.tableCards.find(c => c.id === t.boundToCardId);
+      console.log(`Token ${t.id} (${card?.name || 'unknown'}): x=${t.x}, y=${t.y}`);
+    });
 
     if (phase === 'discard') {
       gameState.seats.filter(id => id !== null).forEach(id => {
@@ -478,39 +603,52 @@ const broadcastState = () => {
         const currentActiveId = gameState.seats[gameState.activePlayerIndex];
         if (currentActiveId !== activePlayerId) return;
 
+        console.log(`[BotTurn] Phase: ${gameState.phase}, Player: ${gameState.activePlayerIndex === 0 ? 'P1' : 'P2'}, Hand: ${botPlayer.hand.length}`);
+
         const currentPhase = gameState.phase;
         const botSocket = { id: activePlayerId, emit: () => {}, broadcast: { emit: () => {} } };
         const isPlayer1 = gameState.activePlayerIndex === 0;
+        const playerIndex = gameState.activePlayerIndex;
 
-        // AI Behavior: Move hero out of castle if another hero is waiting to revive
-        const castlePos = hexToPixel(0, isPlayer1 ? 4 : -4);
-        const castleHero = gameState.tokens.find(t => {
-          const c = gameState.tableCards.find(tc => tc.id === t.boundToCardId);
-          return c && ((isPlayer1 && c.y > 0) || (!isPlayer1 && c.y < 0)) && Math.abs(t.x - castlePos.x) < 10 && Math.abs(t.y - castlePos.y) < 10;
-        });
-        const hasRevivingHero = gameState.counters.some(c => c.type === 'time' && gameState.tableCards.find(tc => tc.id === c.boundToCardId && ((isPlayer1 && tc.y > 0) || (!isPlayer1 && tc.y < 0))));
-        
-        if (castleHero && hasRevivingHero) {
-          // Try to move to an adjacent hex
-          const hex = pixelToHex(castleHero.x, castleHero.y);
-          const neighbors = [
-            { q: hex.q + 1, r: hex.r }, { q: hex.q - 1, r: hex.r },
-            { q: hex.q, r: hex.r + 1 }, { q: hex.q, r: hex.r - 1 },
-            { q: hex.q + 1, r: hex.r - 1 }, { q: hex.q - 1, r: hex.r + 1 }
-          ];
-          for (const neighbor of neighbors) {
-            const pixel = hexToPixel(neighbor.q, neighbor.r);
-            const isOccupied = gameState.tokens.some(t => Math.abs(t.x - pixel.x) < 10 && Math.abs(t.y - pixel.y) < 10);
-            if (!isOccupied) {
-              handlers.move_token_to_cell(botSocket, neighbor);
-              return; // Action taken
+        const getHeroActionScore = (token: any) => {
+          const card = gameState.tableCards.find(tc => tc.id === token.boundToCardId);
+          if (!card) return 0;
+          const ar = getHeroAR(card.heroClass!, card.level);
+          const hex = pixelToHex(token.x, token.y);
+          const attackable = calculateAttackableCells(hex.q, hex.r, ar, gameState.activePlayerIndex, card.level);
+          
+          let bestScore = 50; // Default move score
+
+          for (const cell of attackable) {
+            if (cell.targetType === 'hero') {
+              // Check if target hero is on a magic circle or crystal
+              const targetToken = gameState.tokens.find(t => {
+                const tHex = pixelToHex(t.x, t.y);
+                return tHex.q === cell.q && tHex.r === cell.r;
+              });
+              if (targetToken) {
+                const tHex = pixelToHex(targetToken.x, targetToken.y);
+                const isMC = gameState.magicCircles.some(mc => mc.q === tHex.q && mc.r === tHex.r);
+                const isCrystal = tHex.q === 0 && tHex.r === 0;
+                if (isMC || isCrystal) {
+                  bestScore = Math.max(bestScore, 120); // Very high priority to interrupt scoring
+                } else {
+                  bestScore = Math.max(bestScore, 100);
+                }
+              }
+            } else if (cell.targetType === 'castle') {
+              bestScore = Math.max(bestScore, 90);
+            } else if (cell.targetType === 'monster') {
+              bestScore = Math.max(bestScore, 80);
             }
           }
-        }
+          return bestScore;
+        };
 
         switch (currentPhase) {
           case 'setup':
-            if (!gameState.heroPlayed[activePlayerId]) {
+            const playedCount = gameState.heroPlayedCount[activePlayerId] || 0;
+            if (playedCount < 2) {
               const heroCards = botPlayer.hand.filter(c => c.type === 'hero');
               if (heroCards.length > 0) {
                 // Prioritize hero with largest AR
@@ -520,7 +658,22 @@ const broadcastState = () => {
                   return arB - arA;
                 });
                 const heroCard = sortedHeroes[0];
-                handlers.play_card(botSocket, { cardId: heroCard.id, x: 0, y: isPlayer1 ? 550 : -700 });
+                
+                // Find a free castle
+                const playerIndex = isPlayer1 ? 0 : 1;
+                const playerCastles = CASTLES[playerIndex as 0 | 1];
+                let freeCastleIdx = 0;
+                for (let i = 0; i < playerCastles.length; i++) {
+                  const cCoord = playerCastles[i];
+                  const pos = hexToPixel(cCoord.q, cCoord.r);
+                  const occupied = gameState.tokens.some(t => Math.abs(t.x - pos.x) < 10 && Math.abs(t.y - pos.y) < 10);
+                  if (!occupied) {
+                    freeCastleIdx = i;
+                    break;
+                  }
+                }
+                
+                handlers.play_card(botSocket, { cardId: heroCard.id, targetCastleIndex: freeCastleIdx });
               }
             }
             break;
@@ -537,10 +690,12 @@ const broadcastState = () => {
             const hasHeal = hand.some(c => c.name === '回复');
             const hasSpy = hand.some(c => c.name === '间谍');
             const hasSprint = hand.some(c => c.name === '冲刺');
+            const hasDefense = hand.some(c => c.name === '防御' || c.name === '闪避');
 
             let botTokens = gameState.tokens.filter(t => {
               const c = gameState.tableCards.find(tc => tc.id === t.boundToCardId);
-              return c && ((isPlayer1 && c.y > 0) || (!isPlayer1 && c.y < 0));
+              const isAlive = !gameState.counters.some(counter => counter.type === 'time' && counter.boundToCardId === t.boundToCardId);
+              return c && isAlive && ((isPlayer1 && c.y > 0) || (!isPlayer1 && c.y < 0));
             });
 
             // Filter by Action Limit
@@ -555,232 +710,205 @@ const broadcastState = () => {
               return currentCount < currentHP;
             });
 
-            const getHeroActionScore = (token: any) => {
-              const card = gameState.tableCards.find(tc => tc.id === token.boundToCardId);
-              if (!card) return 0;
-              const ar = getHeroAR(card.heroClass!, card.level);
-              const hex = pixelToHex(token.x, token.y);
-              const attackable = calculateAttackableCells(hex.q, hex.r, ar, gameState.activePlayerIndex, card.level);
-              
-              if (attackable.some(c => c.targetType === 'hero')) return 100;
-              if (attackable.some(c => c.targetType === 'castle')) return 90;
-              if (attackable.some(c => c.targetType === 'monster')) return 80;
-              return 50; // Can move
-            };
 
-            // Sort heroes by their best possible action score
-            botTokens.sort((a, b) => getHeroActionScore(b) - getHeroActionScore(a));
+            const botHeroCount = botTokens.length;
+            const goldY = isPlayer1 ? 550 : -700;
+            const goldCounter = gameState.counters.find(c => c.type === 'gold' && Math.abs(c.y - goldY) < 100);
+            const gold = goldCounter ? goldCounter.value : 0;
 
-            // AI 1 Logic Update
-            if (botDifficulty === 1) {
-              // Priority 1: Attack enemy hero (Score 100)
-              let canAttackEnemyHero = false;
-              for (const token of botTokens) {
-                if (getHeroActionScore(token) === 100) {
-                  canAttackEnemyHero = true;
-                  break;
-                }
-              }
-
-              if (canAttackEnemyHero && (hasAction || hasHeavyStrike)) {
-                const card = hand.find(c => c.name === '行动') || hand.find(c => c.name === '强击')!;
-                handlers.play_card(botSocket, { cardId: card.id, x: 0, y: isPlayer1 ? 550 : -700 });
-                return;
-              }
-
-              // Priority 2: Evolve/Hire (if has Defense or Heavy Strike)
-              const hasDefense = hand.some(c => c.name === '防御' || c.name === '闪避');
-              if (hasDefense || hasHeavyStrike) {
-                if (gameState.canEvolve) {
-                  const card = hand.find(c => c.name === '防御') || hand.find(c => c.name === '闪避') || hand.find(c => c.name === '强击')!;
-                  handlers.play_card(botSocket, { cardId: card.id, x: 0, y: isPlayer1 ? 550 : -700 });
-                  return;
-                }
-                if (gameState.canHire) {
-                  const card = hand.find(c => c.name === '防御') || hand.find(c => c.name === '闪避') || hand.find(c => c.name === '强击')!;
-                  handlers.play_card(botSocket, { cardId: card.id, x: 0, y: isPlayer1 ? 550 : -700 });
-                  return;
-                }
-              }
-            }
-
-            // Default Attack Priority (for AI 2 or AI 1 if above didn't trigger)
-            let targetInRange = false;
-            if (botTokens.length > 0) {
-              const bestHero = botTokens[0];
-              if (getHeroActionScore(bestHero) >= 80) {
-                targetInRange = true;
-              }
-            }
-            if (hasAction && targetInRange) {
-              const card = hand.find(c => c.name === '行动')!;
-              handlers.play_card(botSocket, { cardId: card.id, x: 0, y: isPlayer1 ? 550 : -700 });
-              return;
-            }
-
-            // 2. Hire/Evolve Priority
-            if (gameState.canHire || gameState.canEvolve) {
-              const card = hand.find(c => c.name === '强击') || hand.find(c => c.name === '行动');
+            // 1. Hire if low on heroes and has gold
+            if (botHeroCount < 3 && gold >= 2 && gameState.canHire) {
+              const card = hand.find(c => c.name === '行动') || hand.find(c => c.name === '强击') || hand.find(c => c.name === '防御') || hand.find(c => c.name === '闪避');
               if (card) {
                 handlers.play_card(botSocket, { cardId: card.id, x: 0, y: isPlayer1 ? 550 : -700 });
                 return;
               }
             }
 
-            // 3. Heal/Spy Priority
-            if (hasHeal) {
+            // 2. Attack if high value target in range
+            let bestAttackScore = 0;
+            botTokens.forEach(t => {
+              const score = getHeroActionScore(t);
+              if (score > bestAttackScore) bestAttackScore = score;
+            });
+
+            if (bestAttackScore >= 100 && (hasAction || hasHeavyStrike)) {
+              const card = hand.find(c => c.name === '行动') || hand.find(c => c.name === '强击')!;
+              handlers.play_card(botSocket, { cardId: card.id, x: 0, y: isPlayer1 ? 550 : -700 });
+              return;
+            }
+
+            // 3. Evolve if possible
+            if (gameState.canEvolve && (hasAction || hasHeavyStrike || hasDefense)) {
+              const card = hand.find(c => c.name === '行动') || hand.find(c => c.name === '强击') || hand.find(c => c.name === '防御') || hand.find(c => c.name === '闪避')!;
+              handlers.play_card(botSocket, { cardId: card.id, x: 0, y: isPlayer1 ? 550 : -700 });
+              return;
+            }
+
+            // 4. Heal if low HP
+            const needsHeal = botTokens.some(t => {
+              const c = gameState.tableCards.find(tc => tc.id === t.boundToCardId);
+              return c && (c.damage || 0) >= 2;
+            });
+            if (needsHeal && hasHeal) {
               const card = hand.find(c => c.name === '回复')!;
               handlers.play_card(botSocket, { cardId: card.id, x: 0, y: isPlayer1 ? 550 : -700 });
               return;
             }
+
+            // 5. Move/Sprint to objectives (Split forces)
+            if (botHeroCount > 0 && (hasSprint || hasAction)) {
+              const card = hand.find(c => c.name === '冲刺') || hand.find(c => c.name === '行动')!;
+              handlers.play_card(botSocket, { cardId: card.id, x: 0, y: isPlayer1 ? 550 : -700 });
+              return;
+            }
+
+            // 6. Spy
             if (hasSpy) {
               const card = hand.find(c => c.name === '间谍')!;
               handlers.play_card(botSocket, { cardId: card.id, x: 0, y: isPlayer1 ? 550 : -700 });
               return;
             }
 
-            // 4. Move/Sprint Priority
-            if (hasSprint) {
-              const card = hand.find(c => c.name === '冲刺')!;
-              handlers.play_card(botSocket, { cardId: card.id, x: 0, y: isPlayer1 ? 550 : -700 });
-              return;
-            }
-            if (hasAction) {
-              const card = hand.find(c => c.name === '行动')!;
-              handlers.play_card(botSocket, { cardId: card.id, x: 0, y: isPlayer1 ? 550 : -700 });
-              return;
-            }
-
-            // 6. Pass
             handlers.pass_action(botSocket);
             break;
 
           case 'action_select_option':
-            const lastCard = gameState.playAreaCards[gameState.playAreaCards.length - 1];
+            const lastCard = gameState.playAreaCards.find(c => c.id === gameState.lastPlayedCardId) || 
+                             gameState.tableCards.find(c => c.id === gameState.lastPlayedCardId);
             if (!lastCard) {
               handlers.finish_resolve(botSocket);
               return;
             }
 
-            // 1. Attack / Heavy Strike
-            if (lastCard.name === '行动' || lastCard.name === '强击') {
-              const isHeavyStrike = lastCard.name === '强击';
-              
-              // If heavy strike, we need to play a secondary card first
-              if (isHeavyStrike && !gameState.secondaryCardId) {
-                const secondaryCard = botPlayer.hand.find(c => c.name !== '防御' && c.name !== '闪避');
-                if (secondaryCard) {
-                  handlers.select_option(botSocket, 'heavy_strike');
-                  handlers.play_card(botSocket, { cardId: secondaryCard.id, x: 0, y: isPlayer1 ? 550 : -700 });
-                  return;
-                } else {
-                  // Fallback to normal attack if no secondary card available (though this shouldn't happen if bot played heavy strike)
-                  handlers.select_option(botSocket, 'attack');
-                }
-              } else if (isHeavyStrike && gameState.secondaryCardId && !gameState.selectedOption) {
-                handlers.select_option(botSocket, 'heavy_strike');
-              } else if (!isHeavyStrike && !gameState.selectedOption) {
-                handlers.select_option(botSocket, 'attack');
-              }
+            const enemyPlayerIndex = isPlayer1 ? 1 : 0;
 
-              let botTokens = gameState.tokens.filter(t => {
-                const c = gameState.tableCards.find(tc => tc.id === t.boundToCardId);
-                return c && ((isPlayer1 && c.y > 0) || (!isPlayer1 && c.y < 0));
-              });
+            // 1. Magic Circle Actions (Fire/Chant) - Highest Priority
+            const myTokensForMC = gameState.tokens.filter(t => {
+              const c = gameState.tableCards.find(tc => tc.id === t.boundToCardId);
+              const isAlive = !gameState.counters.some(counter => counter.type === 'time' && counter.boundToCardId === t.boundToCardId);
+              return c && isAlive && ((isPlayer1 && c.y > 0) || (!isPlayer1 && c.y < 0));
+            });
 
-              // Filter by Action Limit
-              botTokens = botTokens.filter(t => {
-                const card = gameState.tableCards.find(tc => tc.id === t.boundToCardId);
-                if (!card) return false;
-                const heroData = heroesDatabase?.heroes?.find((h: any) => h.name === card.heroClass);
-                const levelData = heroData?.levels?.[card.level || 1];
+            // 1.1. Fire if possible
+            for (const token of myTokensForMC) {
+              const hex = pixelToHex(token.x, token.y);
+              const mc = gameState.magicCircles.find(m => m.q === hex.q && m.r === hex.r);
+              if (mc && mc.state === 'chanting' && mc.chantingTokenId === token.id && lastCard.type === 'action') {
+                const card = gameState.tableCards.find(c => c.id === token.boundToCardId);
+                const currentCount = gameState.roundActionCounts[token.id] || 0;
+                const heroData = heroesDatabase?.heroes?.find((h: any) => h.name === card?.heroClass);
+                const levelData = heroData?.levels?.[card?.level || 1];
                 const maxHP = levelData?.hp || 3;
-                const currentHP = maxHP - (card.damage || 0);
-                const currentCount = gameState.roundActionCounts[t.id] || 0;
-                return currentCount < currentHP;
-              });
+                const currentHP = maxHP - (card?.damage || 0);
 
-              const getHeroActionScore = (token: any) => {
-                const card = gameState.tableCards.find(tc => tc.id === token.boundToCardId);
-                if (!card) return 0;
-                const ar = getHeroAR(card.heroClass!, card.level);
-                const hex = pixelToHex(token.x, token.y);
-                const attackable = calculateAttackableCells(hex.q, hex.r, ar, gameState.activePlayerIndex, card.level);
-                
-                if (attackable.some(c => c.targetType === 'hero')) return 100;
-                if (attackable.some(c => c.targetType === 'castle')) return 90;
-                if (attackable.some(c => c.targetType === 'monster')) return 80;
-                return 50; // Can move
-              };
-
-              // Sort heroes by their best possible action score
-              botTokens.sort((a, b) => getHeroActionScore(b) - getHeroActionScore(a));
-
-              for (const token of botTokens) {
-                const card = gameState.tableCards.find(tc => tc.id === token.boundToCardId);
-                if (card) {
-                  const ar = getHeroAR(card.heroClass!, card.level);
-                  const hex = pixelToHex(token.x, token.y);
-                  const attackable = calculateAttackableCells(hex.q, hex.r, ar, gameState.activePlayerIndex, card.level);
-                  
-                  if (attackable.length > 0) {
-                    // Prioritize enemy units over monsters
-                    attackable.sort((a: any, b: any) => {
-                      const score = (t: string) => (t === 'hero' || t === 'castle') ? 2 : 1;
-                      return score(b.targetType) - score(a.targetType);
-                    });
-
-                    if (!gameState.selectedOption) {
-                      handlers.select_option(botSocket, isHeavyStrike ? 'heavy_strike' : 'attack');
-                    }
-                    handlers.select_token(botSocket, token.id);
-                    const targetCell = attackable[0];
-                    handlers.move_token_to_cell(botSocket, targetCell);
-                    handlers.finish_resolve(botSocket);
-                    return;
-                  } else {
-                    // If no attackable cells but this is the best hero, maybe move?
-                    // For now, the loop continues to find a hero that CAN attack.
-                    // If no hero can attack, it will fall through to move logic if implemented.
-                  }
+                if (currentCount < currentHP) {
+                  handlers.select_option(botSocket, 'fire');
+                  handlers.select_token(botSocket, token.id);
+                  return;
                 }
               }
-              
-              // If no hero can attack, pick a hero that can move
-              for (const token of botTokens) {
-                const card = gameState.tableCards.find(tc => tc.id === token.boundToCardId);
-                if (card) {
+            }
+
+            // 1.2. Interrupt enemy on Magic Circle - New Priority
+            const enemyTokensOnMC = gameState.tokens.filter(t => {
+              const c = gameState.tableCards.find(tc => tc.id === t.boundToCardId);
+              const isAlive = !gameState.counters.some(counter => counter.type === 'time' && counter.boundToCardId === t.boundToCardId);
+              if (!c || !isAlive) return false;
+              const isEnemy = isPlayer1 ? c.y < 0 : c.y > 0;
+              if (!isEnemy) return false;
+              const hex = pixelToHex(t.x, t.y);
+              return gameState.magicCircles.some(mc => mc.q === hex.q && mc.r === hex.r);
+            });
+
+            if (enemyTokensOnMC.length > 0 && (lastCard.name === '行动' || lastCard.name === '强击' || lastCard.name === '冲刺')) {
+              // Try to attack or move towards enemy on MC
+              for (const enemyToken of enemyTokensOnMC) {
+                const enemyHex = pixelToHex(enemyToken.x, enemyToken.y);
+                
+                // Check if any bot token can attack this enemy
+                for (const token of myTokensForMC) {
+                  const card = gameState.tableCards.find(c => c.id === token.boundToCardId);
+                  if (!card) continue;
+                  const currentCount = gameState.roundActionCounts[token.id] || 0;
                   const heroData = heroesDatabase?.heroes?.find((h: any) => h.name === card.heroClass);
                   const levelData = heroData?.levels?.[card.level || 1];
-                  const mv = levelData?.mv || 1;
+                  const maxHP = levelData?.hp || 3;
+                  const currentHP = maxHP - (card.damage || 0);
+                  if (currentCount >= currentHP) continue;
+
+                  const ar = getHeroAR(card.heroClass!, card.level);
                   const hex = pixelToHex(token.x, token.y);
-                  const reachable = calculateReachableCells(hex.q, hex.r, mv, gameState.activePlayerIndex);
-                  
-                  if (reachable.length > 0) {
-                    handlers.select_option(botSocket, 'move');
-                    handlers.select_token(botSocket, token.id);
-                    
-                    const enemyCastleQ = 0;
-                    const enemyCastleR = isPlayer1 ? -4 : 4;
-                    let bestCell = reachable[0];
-                    let minDist = hexDistance(bestCell.q, bestCell.r, enemyCastleQ, enemyCastleR);
-                    for (const cell of reachable) {
-                      const dist = hexDistance(cell.q, cell.r, enemyCastleQ, enemyCastleR);
-                      if (dist < minDist) {
-                        minDist = dist;
-                        bestCell = cell;
-                      }
+                  const dist = hexDistance(hex.q, hex.r, enemyHex.q, enemyHex.r);
+
+                  if (dist <= ar && (lastCard.name === '行动' || lastCard.name === '强击')) {
+                    if (!gameState.selectedOption) {
+                      handlers.select_option(botSocket, lastCard.name === '强击' ? 'heavy_strike' : 'attack');
                     }
-                    handlers.move_token_to_cell(botSocket, bestCell);
+                    handlers.select_token(botSocket, token.id);
+                    handlers.move_token_to_cell(botSocket, { q: enemyHex.q, r: enemyHex.r });
                     handlers.finish_resolve(botSocket);
                     return;
                   }
                 }
+
+                // If can't attack, try to move towards it
+                if (lastCard.name === '行动' || lastCard.name === '冲刺') {
+                  const option = lastCard.name === '冲刺' ? 'sprint' : 'move';
+                  for (const token of myTokensForMC) {
+                    const card = gameState.tableCards.find(c => c.id === token.boundToCardId);
+                    if (!card) continue;
+                    const currentCount = gameState.roundActionCounts[token.id] || 0;
+                    const heroData = heroesDatabase?.heroes?.find((h: any) => h.name === card.heroClass);
+                    const levelData = heroData?.levels?.[card.level || 1];
+                    const maxHP = levelData?.hp || 3;
+                    const currentHP = maxHP - (card.damage || 0);
+                    if (currentCount >= currentHP) continue;
+
+                    let mv = levelData?.mv || 1;
+                    if (option === 'sprint') mv += 1;
+                    const hex = pixelToHex(token.x, token.y);
+                    const reachable = calculateReachableCells(hex.q, hex.r, mv, gameState.activePlayerIndex);
+                    
+                    if (reachable.length > 0) {
+                      let bestCell = reachable[0];
+                      let minDist = hexDistance(bestCell.q, bestCell.r, enemyHex.q, enemyHex.r);
+                      for (const cell of reachable) {
+                        const d = hexDistance(cell.q, cell.r, enemyHex.q, enemyHex.r);
+                        if (d < minDist) {
+                          minDist = d;
+                          bestCell = cell;
+                        }
+                      }
+                      handlers.select_option(botSocket, option);
+                      handlers.select_token(botSocket, token.id);
+                      handlers.move_token_to_cell(botSocket, bestCell);
+                      handlers.finish_resolve(botSocket);
+                      return;
+                    }
+                  }
+                }
               }
-              
-              // If no hero can move either, just finish
-              handlers.finish_resolve(botSocket);
-              return;
+            }
+
+            // 1.3. Chant if possible
+            for (const token of myTokensForMC) {
+              const hex = pixelToHex(token.x, token.y);
+              const mc = gameState.magicCircles.find(m => m.q === hex.q && m.r === hex.r);
+              if (mc && mc.state === 'idle') {
+                const card = gameState.tableCards.find(c => c.id === token.boundToCardId);
+                const currentCount = gameState.roundActionCounts[token.id] || 0;
+                const heroData = heroesDatabase?.heroes?.find((h: any) => h.name === card?.heroClass);
+                const levelData = heroData?.levels?.[card?.level || 1];
+                const maxHP = levelData?.hp || 3;
+                const currentHP = maxHP - (card?.damage || 0);
+
+                if (currentCount < currentHP) {
+                  handlers.select_option(botSocket, 'chant');
+                  handlers.select_token(botSocket, token.id);
+                  return;
+                }
+              }
             }
 
             // 2. Hire/Evolve
@@ -801,8 +929,25 @@ const broadcastState = () => {
                 const goldY = isPlayer1 ? 550 : -700;
                 const goldCounter = gameState.counters.find(c => c.type === 'gold' && Math.abs(c.y - goldY) < 100);
                 const maxGold = goldCounter ? goldCounter.value : 2;
-                handlers.hire_hero(botSocket, { cardId: bestHero.id, goldAmount: maxGold });
-                return;
+
+                // Find a free castle
+                const playerIndex = isPlayer1 ? 0 : 1;
+                const playerCastles = CASTLES[playerIndex as 0 | 1];
+                let freeCastleIdx = -1;
+                for (let i = 0; i < playerCastles.length; i++) {
+                  const cCoord = playerCastles[i];
+                  const pos = hexToPixel(cCoord.q, cCoord.r);
+                  const occupied = gameState.tokens.some(t => Math.abs(t.x - pos.x) < 10 && Math.abs(t.y - pos.y) < 10);
+                  if (!occupied) {
+                    freeCastleIdx = i;
+                    break;
+                  }
+                }
+
+                if (freeCastleIdx !== -1) {
+                  handlers.hire_hero(botSocket, { cardId: bestHero.id, goldAmount: maxGold, targetCastleIndex: freeCastleIdx });
+                  return;
+                }
               }
             }
 
@@ -821,15 +966,31 @@ const broadcastState = () => {
               return;
             }
 
-            // 4. Move/Sprint
-            if (lastCard.name === '行动' || lastCard.name === '冲刺') {
-              const option = lastCard.name === '冲刺' ? 'sprint' : 'move';
+            // 4. Attack / Heavy Strike
+            if (lastCard.name === '行动' || lastCard.name === '强击') {
+              const isHeavyStrike = lastCard.name === '强击';
+              
+              if (isHeavyStrike && !gameState.secondaryCardId) {
+                const secondaryCard = botPlayer.hand.find(c => c.name !== '防御' && c.name !== '闪避');
+                if (secondaryCard) {
+                  handlers.select_option(botSocket, 'heavy_strike');
+                  handlers.play_card(botSocket, { cardId: secondaryCard.id, x: 0, y: isPlayer1 ? 550 : -700 });
+                  return;
+                } else {
+                  handlers.select_option(botSocket, 'attack');
+                }
+              } else if (isHeavyStrike && gameState.secondaryCardId && !gameState.selectedOption) {
+                handlers.select_option(botSocket, 'heavy_strike');
+              } else if (!isHeavyStrike && !gameState.selectedOption) {
+                handlers.select_option(botSocket, 'attack');
+              }
+
               let botTokens = gameState.tokens.filter(t => {
                 const c = gameState.tableCards.find(tc => tc.id === t.boundToCardId);
-                return c && ((isPlayer1 && c.y > 0) || (!isPlayer1 && c.y < 0));
+                const isAlive = !gameState.counters.some(counter => counter.type === 'time' && counter.boundToCardId === t.boundToCardId);
+                return c && isAlive && ((isPlayer1 && c.y > 0) || (!isPlayer1 && c.y < 0));
               });
-              
-              // Filter by Action Limit
+
               botTokens = botTokens.filter(t => {
                 const card = gameState.tableCards.find(tc => tc.id === t.boundToCardId);
                 if (!card) return false;
@@ -841,6 +1002,67 @@ const broadcastState = () => {
                 return currentCount < currentHP;
               });
 
+
+              botTokens.sort((a, b) => getHeroActionScore(b) - getHeroActionScore(a));
+
+              for (const token of botTokens) {
+                const card = gameState.tableCards.find(tc => tc.id === token.boundToCardId);
+                if (card) {
+                  const ar = getHeroAR(card.heroClass!, card.level);
+                  const hex = pixelToHex(token.x, token.y);
+                  const attackable = calculateAttackableCells(hex.q, hex.r, ar, gameState.activePlayerIndex, card.level);
+                  
+                  if (attackable.length > 0) {
+                    attackable.sort((a: any, b: any) => {
+                      const score = (t: string) => (t === 'hero' || t === 'castle') ? 2 : 1;
+                      return score(b.targetType) - score(a.targetType);
+                    });
+
+                    if (!gameState.selectedOption) {
+                      handlers.select_option(botSocket, isHeavyStrike ? 'heavy_strike' : 'attack');
+                    }
+                    handlers.select_token(botSocket, token.id);
+                    const targetCell = attackable[0];
+                    handlers.move_token_to_cell(botSocket, targetCell);
+                    handlers.finish_resolve(botSocket);
+                    return;
+                  }
+                }
+              }
+            }
+
+            // 5. Move to Objectives (Split forces)
+            if (lastCard.name === '行动' || lastCard.name === '冲刺') {
+              const option = lastCard.name === '冲刺' ? 'sprint' : 'move';
+              let botTokens = gameState.tokens.filter(t => {
+                const c = gameState.tableCards.find(tc => tc.id === t.boundToCardId);
+                const isAlive = !gameState.counters.some(counter => counter.type === 'time' && counter.boundToCardId === t.boundToCardId);
+                return c && isAlive && ((isPlayer1 && c.y > 0) || (!isPlayer1 && c.y < 0));
+              });
+              
+              botTokens = botTokens.filter(t => {
+                const card = gameState.tableCards.find(tc => tc.id === t.boundToCardId);
+                if (!card) return false;
+                const heroData = heroesDatabase?.heroes?.find((h: any) => h.name === card.heroClass);
+                const levelData = heroData?.levels?.[card.level || 1];
+                const maxHP = levelData?.hp || 3;
+                const currentHP = maxHP - (card.damage || 0);
+                const currentCount = gameState.roundActionCounts[t.id] || 0;
+                return currentCount < currentHP;
+              });
+              
+              let movedAny = false;
+              const claimedObjectives = new Set<string>();
+
+              // Sort bot tokens by proximity to center to decide who goes where first
+              botTokens.sort((a, b) => {
+                const hexA = pixelToHex(a.x, a.y);
+                const hexB = pixelToHex(b.x, b.y);
+                const distA = hexDistance(hexA.q, hexA.r, 0, 0);
+                const distB = hexDistance(hexB.q, hexB.r, 0, 0);
+                return distA - distB;
+              });
+
               for (const token of botTokens) {
                 const card = gameState.tableCards.find(tc => tc.id === token.boundToCardId);
                 if (card) {
@@ -849,30 +1071,80 @@ const broadcastState = () => {
                   let mv = levelData?.mv || 1;
                   if (option === 'sprint') mv += 1;
                   const hex = pixelToHex(token.x, token.y);
+                  
+                  gameState.remainingMv = mv;
+                  gameState.selectedTokenId = token.id;
                   const reachable = calculateReachableCells(hex.q, hex.r, mv, gameState.activePlayerIndex);
                   
                   if (reachable.length > 0) {
-                    handlers.select_option(botSocket, option);
-                    handlers.select_token(botSocket, token.id);
-                    
+                    // Define objectives
                     const enemyCastleQ = 0;
                     const enemyCastleR = isPlayer1 ? -4 : 4;
-                    let bestCell = reachable[0];
-                    let minDist = hexDistance(bestCell.q, bestCell.r, enemyCastleQ, enemyCastleR);
-                    for (const cell of reachable) {
-                      const dist = hexDistance(cell.q, cell.r, enemyCastleQ, enemyCastleR);
-                      if (dist < minDist) {
-                        minDist = dist;
-                        bestCell = cell;
+                    
+                    const objectives = [
+                      { q: 0, r: 0, priority: 100, name: 'Crystal' },
+                      { q: -2, r: 1, priority: 90, name: 'MC1' },
+                      { q: 2, r: -1, priority: 90, name: 'MC2' },
+                      { q: enemyCastleQ, r: enemyCastleR, priority: 80, name: 'Castle' }
+                    ];
+
+                    // Add monsters as objectives if hero is low level
+                    if (card.level < 3) {
+                      MONSTER_HEXES.forEach(m => {
+                        const pos = hexToPixel(m.q, m.r);
+                        const hasTimer = gameState.counters.some(c => c.type === 'time' && Math.abs(c.x - pos.x) < 10 && Math.abs(c.y - pos.y) < 10);
+                        if (!hasTimer) {
+                          objectives.push({ q: m.q, r: m.r, priority: 70 + m.level * 5, name: `MonsterLv${m.level}` });
+                        }
+                      });
+                    }
+
+                    // Find best unclaimed objective
+                    let bestObjective = null;
+                    let bestScore = -Infinity;
+
+                    for (const obj of objectives) {
+                      const objKey = `${obj.q},${obj.r}`;
+                      // Allow multiple heroes to target castle, but others should split
+                      if (claimedObjectives.has(objKey) && obj.name !== 'Castle') continue;
+
+                      const dist = hexDistance(hex.q, hex.r, obj.q, obj.r);
+                      const score = obj.priority - dist * 5;
+                      if (score > bestScore) {
+                        bestScore = score;
+                        bestObjective = obj;
                       }
                     }
-                    handlers.move_token_to_cell(botSocket, bestCell);
-                    handlers.finish_resolve(botSocket);
-                    return;
+
+                    if (bestObjective) {
+                      claimedObjectives.add(`${bestObjective.q},${bestObjective.r}`);
+                      
+                      let bestCell = reachable[0];
+                      let minDist = hexDistance(bestCell.q, bestCell.r, bestObjective.q, bestObjective.r);
+                      for (const cell of reachable) {
+                        const d = hexDistance(cell.q, cell.r, bestObjective.q, bestObjective.r);
+                        if (d < minDist) {
+                          minDist = d;
+                          bestCell = cell;
+                        }
+                      }
+
+                      if (!movedAny) {
+                        handlers.select_option(botSocket, option);
+                        movedAny = true;
+                      }
+                      handlers.select_token(botSocket, token.id);
+                      handlers.move_token_to_cell(botSocket, bestCell);
+                    }
                   }
                 }
               }
+              if (movedAny) {
+                handlers.finish_resolve(botSocket);
+                return;
+              }
             }
+
             handlers.finish_resolve(botSocket);
             break;
 
@@ -887,20 +1159,30 @@ const broadcastState = () => {
                 const defenderMaxHP = getHeroHP(defenderCard.heroClass!, defenderCard.level);
                 const defenderHP = defenderMaxHP - (defenderCard.damage || 0);
 
-                // Priority 5: HP check
-                if (defenderHP > attackerHP) {
-                  // Check counter range
+                const hasDefenseInPlay = gameState.playAreaCards.some(c => c.name === '防御' || c.name === '闪避');
+                const hasDefenseInHand = botPlayer.hand.some(c => c.name === '防御' || c.name === '闪避');
+
+                if (hasDefenseInPlay) {
+                  // Already played defense card, choose between Defend and Counter
                   const defenderToken = gameState.tokens.find(t => t.boundToCardId === defenderCard.id);
                   if (defenderToken) {
                     const attackerHex = pixelToHex(attackerToken.x, attackerToken.y);
                     const defenderHex = pixelToHex(defenderToken.x, defenderToken.y);
                     const dist = hexDistance(attackerHex.q, attackerHex.r, defenderHex.q, defenderHex.r);
                     const ar = getHeroAR(defenderCard.heroClass!, defenderCard.level);
-                    if (dist <= ar) {
+                    
+                    // Counter if attacker is in range and bot is relatively healthy
+                    if (dist <= ar && defenderHP >= 1) {
                       handlers.declare_counter(botSocket);
                       return;
                     }
                   }
+                  handlers.declare_defend(botSocket);
+                  return;
+                } else if (hasDefenseInHand) {
+                  // Need to play defense card first
+                  handlers.declare_defend(botSocket);
+                  return;
                 }
               }
             }
@@ -919,6 +1201,18 @@ const broadcastState = () => {
             }
             break;
 
+          case 'action_play_counter':
+            const counterCard = botPlayer.hand.find(c => c.name === '行动' || c.name === '强击');
+            if (counterCard) {
+              handlers.play_card(botSocket, { cardId: counterCard.id, x: 0, y: isPlayer1 ? 550 : -700 });
+            } else {
+              gameState.phase = 'action_resolve_attack_counter';
+              gameState.activePlayerIndex = 1 - gameState.activePlayerIndex;
+              broadcastState();
+              checkBotTurn();
+            }
+            break;
+
           case 'action_resolve_attack':
             handlers.end_resolve_attack(botSocket);
             break;
@@ -930,11 +1224,20 @@ const broadcastState = () => {
             break;
 
           case 'shop':
-            // Explicitly check hire conditions: sufficient gold, hire area has cards, heroes < 4, and castle is empty
-            const castlePos = hexToPixel(0, isPlayer1 ? 4 : -4);
-            const castleOccupied = gameState.tokens.some(t => Math.abs(t.x - castlePos.x) < 10 && Math.abs(t.y - castlePos.y) < 10);
+            // Explicitly check hire conditions: sufficient gold, hire area has cards, heroes < 4, and at least one castle is empty
+            const playerCastles = CASTLES[playerIndex as 0 | 1];
+            let freeCastleIdx = -1;
+            for (let i = 0; i < playerCastles.length; i++) {
+              const cCoord = playerCastles[i];
+              const pos = hexToPixel(cCoord.q, cCoord.r);
+              const occupied = gameState.tokens.some(t => Math.abs(t.x - pos.x) < 10 && Math.abs(t.y - pos.y) < 10);
+              if (!occupied) {
+                freeCastleIdx = i;
+                break;
+              }
+            }
             
-            if (gameState.canHire && !castleOccupied) {
+            if (gameState.canHire && freeCastleIdx !== -1) {
               const sortedHires = [...gameState.hireAreaCards].sort((a, b) => {
                 const pA = HERO_PRIORITY[a.heroClass || ''] || 0;
                 const pB = HERO_PRIORITY[b.heroClass || ''] || 0;
@@ -944,7 +1247,7 @@ const broadcastState = () => {
               const goldY = isPlayer1 ? 550 : -700;
               const goldCounter = gameState.counters.find(c => c.type === 'gold' && Math.abs(c.y - goldY) < 100);
               const maxGold = goldCounter ? goldCounter.value : 2;
-              handlers.hire_hero(botSocket, { cardId: bestHero.id, goldAmount: maxGold });
+              handlers.hire_hero(botSocket, { cardId: bestHero.id, goldAmount: maxGold, targetCastleIndex: freeCastleIdx });
               return;
             }
             
@@ -959,9 +1262,52 @@ const broadcastState = () => {
             handlers.pass_shop(botSocket);
             break;
 
+          case 'discard':
+            if (botPlayer.hand.length > 6) {
+              handlers.discard_card(botSocket, botPlayer.hand[0].id);
+            } else {
+              handlers.proceed_phase(botSocket);
+            }
+            break;
+
           case 'supply':
           case 'end':
             handlers.proceed_phase(botSocket);
+            break;
+          case 'revival':
+            const pending = gameState.pendingRevivals?.find(r => r.playerIndex === playerIndex);
+            if (pending) {
+              const playerCastles = CASTLES[playerIndex as 0 | 1];
+              let freeCastleIdx = -1;
+              for (let i = 0; i < playerCastles.length; i++) {
+                const pos = hexToPixel(playerCastles[i].q, playerCastles[i].r);
+                const occupied = gameState.tokens.some(t => Math.abs(t.x - pos.x) < 10 && Math.abs(t.y - pos.y) < 10);
+                if (!occupied) {
+                  freeCastleIdx = i;
+                  break;
+                }
+              }
+              if (freeCastleIdx !== -1) {
+                handlers.revive_hero(botSocket, { heroCardId: pending.heroCardId, targetCastleIndex: freeCastleIdx });
+              } else {
+                // Fallback: if no free castle, just remove it from pendingRevivals to avoid getting stuck
+                gameState.pendingRevivals = gameState.pendingRevivals.filter(r => r !== pending);
+                if (gameState.pendingRevivals.length === 0) {
+                  gameState.round += 1;
+                  gameState.roundActionCounts = {};
+                  gameState.phase = 'action_play';
+                  gameState.activePlayerIndex = gameState.firstPlayerIndex;
+                  gameState.consecutivePasses = 0;
+                  gameState.hasSeizedInitiative = false;
+                  Object.values(gameState.players).forEach(p => p.discardFinished = false);
+                  addLog(`进入第 ${gameState.round} 回合`, -1);
+                } else {
+                  gameState.activePlayerIndex = gameState.pendingRevivals[0].playerIndex;
+                }
+                io.emit('state_update', gameState);
+                checkBotTurn();
+              }
+            }
             break;
         }
       }, 800);
@@ -969,45 +1315,112 @@ const broadcastState = () => {
   };
 
   const handlers = {
+    checkAndResetChanting: (tokenId: string) => {
+      const magicCircle = gameState.magicCircles.find(mc => mc.state === 'chanting' && mc.chantingTokenId === tokenId);
+      if (magicCircle) {
+        const token = gameState.tokens.find(t => t.id === tokenId);
+        const card = token ? gameState.tableCards.find(c => c.id === token.boundToCardId) : null;
+        const ownerIndex = card ? (card.y > 0 ? 0 : 1) : -1;
+
+        magicCircle.state = 'idle';
+        magicCircle.chantingTokenId = undefined;
+        if (ownerIndex !== -1) {
+          addLog(`玩家${ownerIndex + 1}的英雄中断了咏唱 (Player ${ownerIndex + 1}'s hero interrupted chanting)`, ownerIndex);
+        }
+      }
+    },
+    revive_hero: (socket: any, { heroCardId, targetCastleIndex }: { heroCardId: string, targetCastleIndex: number }) => {
+      const player = gameState.players[socket.id];
+      if (!player || gameState.phase !== 'revival') return;
+
+      const isPlayer1 = gameState.seats[0] === socket.id;
+      const isPlayer2 = gameState.seats[1] === socket.id;
+      const playerIndex = isPlayer1 ? 0 : 1;
+
+      if (!gameState.pendingRevivals) return;
+      const revivalIndex = gameState.pendingRevivals.findIndex(r => r.heroCardId === heroCardId && r.playerIndex === playerIndex);
+      if (revivalIndex === -1) return;
+
+      const playerCastles = CASTLES[playerIndex as 0 | 1];
+      const castleCoord = playerCastles[targetCastleIndex] || playerCastles[0];
+      const castlePos = hexToPixel(castleCoord.q, castleCoord.r);
+
+      const occupied = gameState.tokens.some(t => Math.abs(t.x - castlePos.x) < 10 && Math.abs(t.y - castlePos.y) < 10);
+      if (occupied) {
+        socket.emit('error_message', '王城已被占用，请选择其他位置。');
+        return;
+      }
+
+      const heroCard = gameState.tableCards.find(c => c.id === heroCardId);
+      const token = gameState.tokens.find(t => t.boundToCardId === heroCardId);
+      if (token && heroCard) {
+        token.x = castlePos.x;
+        token.y = castlePos.y;
+        addLog(`${heroCard.heroClass} 在王城复活！`, playerIndex);
+      }
+
+      gameState.pendingRevivals.splice(revivalIndex, 1);
+
+      if (gameState.pendingRevivals.length === 0) {
+        // Proceed to next round
+        gameState.round += 1;
+        gameState.roundActionCounts = {};
+        gameState.phase = 'action_play';
+        gameState.activePlayerIndex = gameState.firstPlayerIndex;
+        gameState.consecutivePasses = 0;
+        gameState.hasSeizedInitiative = false;
+        Object.values(gameState.players).forEach(p => p.discardFinished = false);
+        addLog(`进入第 ${gameState.round} 回合`, -1);
+      } else {
+        gameState.activePlayerIndex = gameState.pendingRevivals[0].playerIndex;
+      }
+      io.emit('state_update', gameState);
+      checkBotTurn();
+    },
+    select_hire_cost: (socket: any, cost: number) => {
+      const isPlayer1 = gameState.seats[0] === socket.id;
+      const isPlayer2 = gameState.seats[1] === socket.id;
+      const playerIndex = isPlayer1 ? 0 : (isPlayer2 ? 1 : -1);
+      
+      if (playerIndex === gameState.activePlayerIndex) {
+        gameState.selectedHireCost = cost;
+        io.emit('state_update', gameState);
+      }
+    },
     select_token: (socket: any, tokenId: string) => {
       const isPlayer1 = gameState.seats[0] === socket.id;
       const isPlayer2 = gameState.seats[1] === socket.id;
       const playerIndex = isPlayer1 ? 0 : (isPlayer2 ? 1 : -1);
       
       if (gameState.phase === 'action_select_option' && playerIndex === gameState.activePlayerIndex) {
-        const isAction = ['move', 'sprint', 'attack', 'heavy_strike'].includes(gameState.selectedOption || '');
+        const isAction = ['move', 'sprint', 'attack', 'heavy_strike', 'chant', 'fire'].includes(gameState.selectedOption || '');
         
-        if (gameState.selectedOption === 'move' || gameState.selectedOption === 'sprint') {
-          const token = gameState.tokens.find(t => t.id === tokenId);
-          if (token && token.boundToCardId) {
-            const card = gameState.tableCards.find(c => c.id === token.boundToCardId);
-            if (card && ((isPlayer1 && card.y > 0) || (isPlayer2 && card.y < 0))) {
-              // Action Limit Check
-              if (isAction) {
-                const heroData = heroesDatabase?.heroes?.find((h: any) => h.name === card.heroClass);
-                const levelData = heroData?.levels?.[card.level || 1];
-                const maxHP = levelData?.hp || 3;
-                const currentHP = maxHP - (card.damage || 0);
-                const currentCount = gameState.roundActionCounts[tokenId] || 0;
-                
-                // If this is a new selection, we need to check the limit
-                if (gameState.selectedTokenId !== tokenId) {
-                  if (currentCount >= currentHP) {
-                    socket.emit('error_message', `该英雄本回合行动次数已达上限（当前血量：${currentHP}）。 (Action limit reached for this hero this round based on current HP.)`);
-                    return;
-                  }
-                  
-                  // Manage counts for selection change
-                  if (gameState.selectedTokenId) {
-                    const prevTokenId = gameState.selectedTokenId;
-                    if (gameState.roundActionCounts[prevTokenId] > 0) {
-                      gameState.roundActionCounts[prevTokenId]--;
-                    }
-                  }
-                  gameState.roundActionCounts[tokenId] = (gameState.roundActionCounts[tokenId] || 0) + 1;
+        const token = gameState.tokens.find(t => t.id === tokenId);
+        if (token && token.boundToCardId) {
+          const isAlive = !gameState.counters.some(counter => counter.type === 'time' && counter.boundToCardId === token.boundToCardId);
+          if (!isAlive) {
+            socket.emit('error_message', '该英雄正在复活中，无法行动。');
+            return;
+          }
+          const card = gameState.tableCards.find(c => c.id === token.boundToCardId);
+          if (card && ((isPlayer1 && card.y > 0) || (isPlayer2 && card.y < 0))) {
+            
+            if (gameState.selectedOption === 'move' || gameState.selectedOption === 'sprint') {
+              if (!gameState.globalMovementMovedTokens) gameState.globalMovementMovedTokens = [];
+              
+              if (gameState.globalMovementMovedTokens.includes(tokenId)) {
+                socket.emit('error_message', '该英雄在本次全军行军中已经移动过。 (This hero has already moved in this global movement.)');
+                return;
+              }
+
+              // If selecting a new token, finalize the previous one
+              if (gameState.selectedTokenId && gameState.selectedTokenId !== tokenId) {
+                if (gameState.remainingMv !== undefined && gameState.remainingMv < (gameState.selectedOption === 'sprint' ? (heroesDatabase?.heroes?.find((h: any) => h.name === gameState.tableCards.find(c => c.id === gameState.tokens.find(t => t.id === gameState.selectedTokenId)?.boundToCardId)?.heroClass)?.levels?.[gameState.tableCards.find(c => c.id === gameState.tokens.find(t => t.id === gameState.selectedTokenId)?.boundToCardId)?.level || 1]?.mv || 1) + 1 : (heroesDatabase?.heroes?.find((h: any) => h.name === gameState.tableCards.find(c => c.id === gameState.tokens.find(t => t.id === gameState.selectedTokenId)?.boundToCardId)?.heroClass)?.levels?.[gameState.tableCards.find(c => c.id === gameState.tokens.find(t => t.id === gameState.selectedTokenId)?.boundToCardId)?.level || 1]?.mv || 1))) {
+                  gameState.globalMovementMovedTokens.push(gameState.selectedTokenId);
                 }
               }
 
+              const oldSelectedTokenId = gameState.selectedTokenId;
               gameState.selectedTokenId = tokenId;
               if (!gameState.movedTokens) gameState.movedTokens = {};
               if (!gameState.movedTokens[tokenId]) {
@@ -1017,17 +1430,141 @@ const broadcastState = () => {
               const levelData = heroData?.levels?.[card.level || 1];
               let mv = levelData?.mv || 1;
               if (gameState.selectedOption === 'sprint') mv += 1;
-              gameState.remainingMv = mv;
+              
+              // Only reset remainingMv if it's a new selection, otherwise keep current remainingMv
+              if (!gameState.globalMovementMovedTokens.includes(tokenId) && oldSelectedTokenId !== tokenId) {
+                  // Check if this token has movement history
+                  const hasHistory = gameState.movementHistory && gameState.movementHistory.some(step => step.tokenId === tokenId);
+                  if (hasHistory) {
+                    const totalMvCost = gameState.movementHistory!.filter(step => step.tokenId === tokenId).reduce((sum, step) => sum + step.mvCost, 0);
+                    gameState.remainingMv = mv - totalMvCost;
+                  } else {
+                    // Check action limit for movement
+                    const maxHP = levelData?.hp || 3;
+                    const currentHP = maxHP - (card.damage || 0);
+                    const currentCount = gameState.roundActionCounts[tokenId] || 0;
+                    if (currentCount >= currentHP) {
+                      socket.emit('error_message', `该英雄本回合行动次数已达上限（当前血量：${currentHP}）。 (Action limit reached for this hero this round based on current HP.)`);
+                      gameState.selectedTokenId = oldSelectedTokenId;
+                      return;
+                    }
+
+                    gameState.remainingMv = mv;
+                  }
+              } else if (gameState.remainingMv === undefined) {
+                  gameState.remainingMv = mv;
+              }
+              
               const hex = pixelToHex(token.x, token.y);
-              gameState.reachableCells = calculateReachableCells(hex.q, hex.r, mv, playerIndex);
+              gameState.reachableCells = calculateReachableCells(hex.q, hex.r, gameState.remainingMv, playerIndex);
               broadcastState();
-            }
-          }
-        } else if (gameState.selectedOption === 'attack' || (gameState.selectedOption === 'heavy_strike' && gameState.secondaryCardId)) {
-          const token = gameState.tokens.find(t => t.id === tokenId);
-          if (token && token.boundToCardId) {
-            const card = gameState.tableCards.find(c => c.id === token.boundToCardId);
-            if (card && ((isPlayer1 && card.y > 0) || (isPlayer2 && card.y < 0))) {
+            } else if (gameState.selectedOption === 'chant') {
+              const hex = pixelToHex(token.x, token.y);
+              const magicCircle = gameState.magicCircles.find(mc => mc.q === hex.q && mc.r === hex.r);
+              if (!magicCircle) {
+                socket.emit('error_message', '英雄必须在魔法阵上才能咏唱。 (Hero must be on a magic circle to chant.)');
+                return;
+              }
+              if (magicCircle.state === 'chanting') {
+                socket.emit('error_message', '该魔法阵已经在咏唱中。 (This magic circle is already chanting.)');
+                return;
+              }
+
+              // Action Limit Check
+              const heroData = heroesDatabase?.heroes?.find((h: any) => h.name === card.heroClass);
+              const levelData = heroData?.levels?.[card.level || 1];
+              const maxHP = levelData?.hp || 3;
+              const currentHP = maxHP - (card.damage || 0);
+              const currentCount = gameState.roundActionCounts[tokenId] || 0;
+              if (currentCount >= currentHP) {
+                socket.emit('error_message', `该英雄本回合行动次数已达上限（当前血量：${currentHP}）。 (Action limit reached for this hero this round based on current HP.)`);
+                return;
+              }
+
+              // Apply chant
+              magicCircle.state = 'chanting';
+              magicCircle.chantingTokenId = tokenId;
+              gameState.roundActionCounts[tokenId] = currentCount + 1;
+              
+              addLog(`玩家${playerIndex + 1}的${card.heroClass}开始咏唱`, playerIndex);
+              
+              // Finish action
+              gameState.phase = 'action_play';
+              gameState.selectedOption = null;
+              gameState.selectedTargetId = null;
+              gameState.selectedTokenId = null;
+              gameState.activePlayerIndex = 1 - gameState.activePlayerIndex;
+              broadcastState();
+              checkBotTurn();
+              return;
+
+            } else if (gameState.selectedOption === 'fire') {
+              const hex = pixelToHex(token.x, token.y);
+              const magicCircle = gameState.magicCircles.find(mc => mc.q === hex.q && mc.r === hex.r);
+              if (!magicCircle) {
+                socket.emit('error_message', '英雄必须在魔法阵上才能开火。 (Hero must be on a magic circle to fire.)');
+                return;
+              }
+              if (magicCircle.state !== 'chanting' || magicCircle.chantingTokenId !== tokenId) {
+                socket.emit('error_message', '该英雄没有在该魔法阵上咏唱。 (This hero is not chanting on this magic circle.)');
+                return;
+              }
+
+              // Action Limit Check
+              const heroData = heroesDatabase?.heroes?.find((h: any) => h.name === card.heroClass);
+              const levelData = heroData?.levels?.[card.level || 1];
+              const maxHP = levelData?.hp || 3;
+              const currentHP = maxHP - (card.damage || 0);
+              const currentCount = gameState.roundActionCounts[tokenId] || 0;
+              if (currentCount >= currentHP) {
+                socket.emit('error_message', `该英雄本回合行动次数已达上限（当前血量：${currentHP}）。 (Action limit reached for this hero this round based on current HP.)`);
+                return;
+              }
+
+              // Apply fire
+              const enemyPlayerIndex = 1 - playerIndex;
+              gameState.castleHP[enemyPlayerIndex] -= 1;
+              
+              // Reputation scoring for damaging castle via fire
+              addReputation(playerIndex, 2, "王城伤害");
+              
+              magicCircle.state = 'idle';
+              magicCircle.chantingTokenId = undefined;
+              gameState.roundActionCounts[tokenId] = currentCount + 1;
+
+              addLog(`玩家${playerIndex + 1}的${card.heroClass}开火，对敌方王城造成1点伤害！`, playerIndex);
+              
+              // Recoil Mechanism
+              const enemyCastleQ = 0;
+              const enemyCastleR = enemyPlayerIndex === 0 ? 4 : -4; // Enemy castle position
+              const currentHex = pixelToHex(token.x, token.y);
+              const recoilHex = getRecoilHex(currentHex, { q: enemyCastleQ, r: enemyCastleR }, gameState);
+              
+              if (recoilHex.q !== currentHex.q || recoilHex.r !== currentHex.r) {
+                const recoilPixel = hexToPixel(recoilHex.q, recoilHex.r);
+                token.x = recoilPixel.x;
+                token.y = recoilPixel.y;
+                addLog(`${card.heroClass} 受到后坐力影响，后退至 (${recoilHex.q}, ${recoilHex.r})`, playerIndex);
+              }
+
+              if (gameState.castleHP[enemyPlayerIndex] <= 0) {
+                gameState.notification = `游戏结束！玩家 ${playerIndex + 1} 摧毁了敌方王城，获得胜利！`;
+                gameState.gameStarted = false;
+              } else {
+                gameState.notification = `王城受到攻击！玩家 ${enemyPlayerIndex + 1} 的王城 HP 剩余 ${gameState.castleHP[enemyPlayerIndex]}。`;
+              }
+
+              // Finish action
+              gameState.phase = 'action_play';
+              gameState.selectedOption = null;
+              gameState.selectedTargetId = null;
+              gameState.selectedTokenId = null;
+              gameState.activePlayerIndex = 1 - gameState.activePlayerIndex;
+              broadcastState();
+              checkBotTurn();
+              return;
+
+            } else if (gameState.selectedOption === 'attack' || (gameState.selectedOption === 'heavy_strike' && gameState.secondaryCardId)) {
               const heroData = heroesDatabase?.heroes?.find((h: any) => h.name === card.heroClass);
               const levelData = heroData?.levels?.[card.level || 1];
               const ar = levelData?.ar || 1;
@@ -1099,11 +1636,25 @@ const broadcastState = () => {
             const dist = getPathDist(currentHex, {q, r});
             if (dist <= gameState.remainingMv!) {
               if (!gameState.movementHistory) gameState.movementHistory = [];
-              gameState.movementHistory.push({ tokenId: token.id, fromX: token.x, fromY: token.y, mvCost: dist });
+              
+              // Check if leaving a magic circle while chanting
+              const wasChanting = gameState.magicCircles?.some(mc => mc.chantingTokenId === token.id);
+              
+              gameState.movementHistory.push({ tokenId: token.id, fromX: token.x, fromY: token.y, mvCost: dist, wasChanting });
+              
+              handlers.checkAndResetChanting(token.id);
+
               const pos = hexToPixel(q, r);
               token.x = pos.x;
               token.y = pos.y;
               gameState.remainingMv! -= dist;
+
+              // Increment action count for this token if it's the first move in this action
+              const hasMovedThisAction = gameState.movementHistory?.some(step => step.tokenId === token.id && step.mvCost > 0 && step !== gameState.movementHistory![gameState.movementHistory!.length - 1]);
+              if (!hasMovedThisAction) {
+                if (!gameState.roundActionCounts[token.id]) gameState.roundActionCounts[token.id] = 0;
+                gameState.roundActionCounts[token.id]++;
+              }
               
               const card = gameState.tableCards.find(c => c.id === token.boundToCardId);
               if (card) {
@@ -1118,6 +1669,9 @@ const broadcastState = () => {
               broadcastState();
             }
           } else if (gameState.selectedOption === 'attack' || (gameState.selectedOption === 'heavy_strike' && gameState.secondaryCardId)) {
+            // Interrupt chanting when performing an action
+            handlers.checkAndResetChanting(token.id);
+
             // Handle attack on hex
             const monster = MONSTER_HEXES.find(m => m.q === q && m.r === r);
             if (monster) {
@@ -1156,6 +1710,10 @@ const broadcastState = () => {
                   
                   addLog(`奖励阶段: ${heroCard?.heroClass} 击败了 LV${monster.level}怪物，获得 ${monster.level} 经验和 ${monster.level} 金币`, playerIndex);
                   gameState.notification = `击杀怪物！获得 ${monster.level} 经验和 ${monster.level} 金币。 (Monster killed! Gained ${monster.level} EXP and ${monster.level} Gold.)`;
+                  
+                  // Reputation scoring
+                  const reputationGain = monster.level >= 3 ? 2 : 1;
+                  addReputation(playerIndex, reputationGain, `击杀LV${monster.level}怪物`);
                 } else {
                   // Monster counter-attacks
                   if (heroCard) {
@@ -1181,6 +1739,7 @@ const broadcastState = () => {
                       
                       // Add time counter to hero card
                       gameState.counters.push({ id: generateId(), type: 'time', x: heroCard.x, y: heroCard.y, value: 0, boundToCardId: heroCard.id });
+                      handlers.checkAndResetChanting(token.id);
                       
                       addLog(`阵亡阶段: ${heroCard.heroClass} 已阵亡`, playerIndex);
                       gameState.notification += ` ${heroCard.heroClass} 阵亡！ (Hero died!)`;
@@ -1188,14 +1747,12 @@ const broadcastState = () => {
                   }
                 }
                 
-                // Finish attack action
-                gameState.phase = 'action_play';
+                // Finish attack action - stay in select option phase to let finish_resolve handle turn swap
                 gameState.selectedOption = null;
                 gameState.selectedTargetId = null;
                 gameState.selectedTokenId = null;
                 gameState.reachableCells = [];
-                gameState.activePlayerIndex = 1 - gameState.activePlayerIndex;
-                addLog(`玩家${playerIndex + 1}攻击了怪物并结束回合`, playerIndex);
+                addLog(`玩家${playerIndex + 1}攻击了怪物并等待结算完成`, playerIndex);
                 broadcastState();
                 checkBotTurn();
                 return;
@@ -1214,6 +1771,9 @@ const broadcastState = () => {
                 const enemyIndex = 1 - playerIndex;
                 gameState.castleHP[enemyIndex] = (gameState.castleHP[enemyIndex] || 3) - 1;
                 
+                // Reputation scoring for damaging castle
+                addReputation(playerIndex, 2, "王城伤害");
+                
                 const heroCard = gameState.tableCards.find(c => c.id === token.boundToCardId);
                 if (heroCard) {
                   addLog(`发起阶段: ${heroCard.heroClass} 对 玩家${enemyIndex + 1}王城 发起了攻击`, playerIndex);
@@ -1231,12 +1791,11 @@ const broadcastState = () => {
                   gameState.gameStarted = false;
                 }
                 
-                gameState.phase = 'action_play';
+                // Finish attack action - stay in select option phase to let finish_resolve handle turn swap
                 gameState.selectedOption = null;
                 gameState.selectedTargetId = null;
                 gameState.selectedTokenId = null;
                 gameState.reachableCells = [];
-                gameState.activePlayerIndex = 1 - gameState.activePlayerIndex;
                 broadcastState();
                 checkBotTurn();
                 return;
@@ -1289,15 +1848,28 @@ const broadcastState = () => {
           return;
         }
         if (option === 'hire') {
-          const castlePos = hexToPixel(0, isPlayer1 ? 4 : -4);
-          const castleHasHero = gameState.tokens.some(t => Math.abs(t.x - castlePos.x) < 10 && Math.abs(t.y - castlePos.y) < 10);
-          if (castleHasHero) {
-            socket.emit('error_message', '王城中已有英雄，无法雇佣。 (Castle is occupied, cannot hire.)');
+          const playerCastles = CASTLES[playerIndex as 0 | 1];
+          const anyCastleFree = playerCastles.some(cCoord => {
+            const pos = hexToPixel(cCoord.q, cCoord.r);
+            return !gameState.tokens.some(t => Math.abs(t.x - pos.x) < 10 && Math.abs(t.y - pos.y) < 10);
+          });
+          
+          if (!anyCastleFree) {
+            socket.emit('error_message', '所有王城均被占用，无法雇佣。 (All castles are occupied, cannot hire.)');
             return;
           }
           const goldCounter = gameState.counters.find(c => c.type === 'gold' && (isPlayer1 ? (c.x === -150 && c.y === 550) : (c.x === -150 && c.y === -700)));
           if (!goldCounter || goldCounter.value < 2) {
             socket.emit('error_message', '金币不足，无法雇佣。 (Not enough gold to hire.)');
+            return;
+          }
+        }
+
+        if (option === 'fire') {
+          const lastCard = gameState.playAreaCards[gameState.playAreaCards.length - 1] || 
+                           gameState.tableCards.find(c => c.id === gameState.lastPlayedCardId);
+          if (!lastCard || lastCard.type !== 'action') {
+            socket.emit('error_message', '只有打出行动卡才能开火。 (Only action cards can trigger fire.)');
             return;
           }
         }
@@ -1311,7 +1883,9 @@ const broadcastState = () => {
           'evolve': '进化',
           'hire': '雇佣',
           'spy': '间谍',
-          'seize': '抢先手'
+          'seize': '抢先手',
+          'chant': '咏唱',
+          'fire': '开火'
         };
         if (optionNames[option]) {
           addLog(`玩家${playerIndex + 1}选择了${optionNames[option]}`, playerIndex);
@@ -1361,6 +1935,22 @@ const broadcastState = () => {
         io.emit('state_update', gameState);
         checkBotTurn();
       } else if (gameState.phase === 'end') {
+        // Reputation scoring for end of round
+        const scoredPlayers = new Set<number>();
+        gameState.tokens.forEach(token => {
+          const hex = pixelToHex(token.x, token.y);
+          const isMagicCircle = gameState.magicCircles.some(mc => mc.q === hex.q && mc.r === hex.r);
+          const isCrystal = hex.q === 0 && hex.r === 0;
+          
+          if (isMagicCircle || isCrystal) {
+            const card = gameState.tableCards.find(c => c.id === token.boundToCardId);
+            if (card) {
+              const playerIdx = card.y > 0 ? 0 : 1;
+              addReputation(playerIdx, 1, isCrystal ? "占领水晶" : "占领魔法阵");
+            }
+          }
+        });
+
         // Execute end round logic
         if (gameState.playAreaCards.length > 0) {
           gameState.discardPiles.action.push(...gameState.playAreaCards);
@@ -1368,6 +1958,21 @@ const broadcastState = () => {
         }
         
         const countersToRemove: string[] = [];
+        const pendingRevivals: any[] = [];
+        const freeCastlesCount = { 0: 0, 1: 0 };
+        
+        // Count free castles for each player
+        for (let pIdx = 0; pIdx < 2; pIdx++) {
+          const playerCastles = CASTLES[pIdx as 0 | 1];
+          for (const cCoord of playerCastles) {
+            const pos = hexToPixel(cCoord.q, cCoord.r);
+            const occupied = gameState.tokens.some(t => Math.abs(t.x - pos.x) < 10 && Math.abs(t.y - pos.y) < 10);
+            if (!occupied) {
+              freeCastlesCount[pIdx as 0 | 1]++;
+            }
+          }
+        }
+        
         gameState.counters.forEach(counter => {
           if (counter.type === 'time') {
             counter.value += 1;
@@ -1377,20 +1982,15 @@ const broadcastState = () => {
               if (heroCard && heroCard.type === 'hero') {
                 if (counter.value >= 3) {
                   const isPlayer1 = heroCard.y > 0;
-                  const castlePos = hexToPixel(0, isPlayer1 ? 4 : -4);
-                  const castleOccupied = gameState.tokens.some(t => Math.abs(t.x - castlePos.x) < 10 && Math.abs(t.y - castlePos.y) < 10);
+                  const playerIndex = isPlayer1 ? 0 : 1;
                   
-                  if (!castleOccupied) {
+                  if (freeCastlesCount[playerIndex as 0 | 1] > 0) {
+                    pendingRevivals.push({ heroCardId: heroCard.id, playerIndex });
                     countersToRemove.push(counter.id);
-                    // Revive hero at capital
-                    const token = gameState.tokens.find(t => t.boundToCardId === heroCard.id);
-                    if (token) {
-                      token.x = castlePos.x;
-                      token.y = castlePos.y;
-                      gameState.notification = (gameState.notification ? gameState.notification + ' ' : '') + `${heroCard.heroClass} 在王城复活！ (Hero revived!)`;
-                    }
+                    freeCastlesCount[playerIndex as 0 | 1]--;
                   } else {
-                    gameState.notification = (gameState.notification ? gameState.notification + ' ' : '') + `${heroCard.heroClass} 等待复活，但王城被占用。 (Hero waiting to revive, but castle is occupied.)`;
+                    counter.value = 2; // Keep it at 2 so it tries again next round
+                    gameState.notification = (gameState.notification ? gameState.notification + ' ' : '') + `${heroCard.heroClass} 等待复活，但所有王城都被占用。 (Hero waiting to revive, but all castles are occupied.)`;
                   }
                 }
                 return;
@@ -1402,7 +2002,6 @@ const broadcastState = () => {
               const isOccupied = gameState.tokens.some(t => Math.abs(t.x - counter.x) < 10 && Math.abs(t.y - counter.y) < 10);
               if (!isOccupied) {
                 countersToRemove.push(counter.id);
-                // Refresh logic could go here if implemented
                 gameState.notification = (gameState.notification ? gameState.notification + ' ' : '') + `地图资源已刷新！ (Map resources refreshed!)`;
               }
             }
@@ -1411,6 +2010,16 @@ const broadcastState = () => {
         
         if (countersToRemove.length > 0) {
           gameState.counters = gameState.counters.filter(c => !countersToRemove.includes(c.id));
+        }
+
+        if (pendingRevivals.length > 0) {
+          gameState.pendingRevivals = pendingRevivals;
+          gameState.phase = 'revival';
+          gameState.activePlayerIndex = pendingRevivals[0].playerIndex;
+          addLog(`进入复活阶段`, -1);
+          io.emit('state_update', gameState);
+          checkBotTurn();
+          return;
         }
         
         gameState.round += 1;
@@ -1471,6 +2080,7 @@ const broadcastState = () => {
           addLog(`进入补给阶段`, -1);
         } else {
           gameState.activePlayerIndex = 1 - gameState.activePlayerIndex;
+          updateAvailableActions(gameState.activePlayerIndex);
         }
         gameState.movedTokens = undefined;
         gameState.movementHistory = undefined;
@@ -1524,12 +2134,14 @@ const broadcastState = () => {
       
       if (gameState.phase === 'action_defend' && playerIndex === gameState.activePlayerIndex) {
         const defenseCard = gameState.playAreaCards.find(c => c.name === '防御' || c.name === '闪避');
-        const targetCard = gameState.tableCards.find(c => c.id === gameState.selectedTargetId);
-        if (targetCard && defenseCard) {
-          addLog(`响应阶段: ${targetCard.heroClass} 打出了 ${defenseCard.name} 卡`, playerIndex);
-        } else {
-          addLog(`玩家${playerIndex + 1}选择反击 (Declare Counter)`, playerIndex);
+        if (!defenseCard) {
+          socket.emit('error_message', '请先打出一张防御卡。 (Please play a defense card first.)');
+          return;
         }
+
+        const targetCard = gameState.tableCards.find(c => c.id === gameState.selectedTargetId);
+        addLog(`响应阶段: ${targetCard?.heroClass || '英雄'} 选择反击 (Declare Counter)`, playerIndex);
+
         const attackerToken = gameState.tokens.find(t => t.id === gameState.selectedTokenId);
         const defenderCard = gameState.tableCards.find(c => c.id === gameState.selectedTargetId);
         const defenderToken = gameState.tokens.find(t => t.boundToCardId === gameState.selectedTargetId);
@@ -1549,14 +2161,8 @@ const broadcastState = () => {
           }
         }
 
-        const hasDefenseCard = !!defenseCard;
-        if (hasDefenseCard) {
-          gameState.phase = 'action_resolve_attack_counter';
-          gameState.activePlayerIndex = 1 - gameState.activePlayerIndex;
-        } else {
-          gameState.phase = 'action_play_defense';
-          gameState.notification = '请打出一张防御卡。 (Please play a defense card.)';
-        }
+        gameState.phase = 'action_resolve_attack_counter';
+        gameState.activePlayerIndex = 1 - gameState.activePlayerIndex;
         broadcastState();
         checkBotTurn();
       }
@@ -1576,6 +2182,11 @@ const broadcastState = () => {
           if (targetCard) {
             const damage = gameState.selectedOption === 'heavy_strike' ? 2 : 1;
             targetCard.damage = (targetCard.damage || 0) + damage;
+
+            // Interrupt chanting when attacked
+            const targetToken = gameState.tokens.find(t => t.boundToCardId === targetCard.id);
+            if (targetToken) handlers.checkAndResetChanting(targetToken.id);
+
             let damageCounter = gameState.counters.find(c => c.type === 'damage' && c.boundToCardId === targetCard.id);
             if (!damageCounter) {
                damageCounter = { id: generateId(), type: 'damage', x: targetCard.x, y: targetCard.y, value: 0, boundToCardId: targetCard.id };
@@ -1610,6 +2221,7 @@ const broadcastState = () => {
               
               // Add time counter to hero card
               gameState.counters.push({ id: generateId(), type: 'time', x: targetCard.x, y: targetCard.y, value: 0, boundToCardId: targetCard.id });
+              if (token) handlers.checkAndResetChanting(token.id);
               
               addLog(`阵亡阶段: ${targetCard.heroClass} 已阵亡`, playerIndex);
               gameState.notification += ` ${targetCard.heroClass} 阵亡！ (Hero died!)`;
@@ -1625,6 +2237,9 @@ const broadcastState = () => {
                 
                 addLog(`奖励阶段: ${attackerCard?.heroClass} 击败了 ${targetCard.heroClass}，获得 ${reward} 经验和 ${reward} 金币`, playerIndex);
                 gameState.notification += ` 获得 ${reward} 经验和 ${reward} 金币。 (Gained ${reward} EXP and ${reward} Gold.)`;
+                
+                // Reputation scoring
+                addReputation(playerIndex, 2, "击杀敌方英雄");
               }
             }
           }
@@ -1655,12 +2270,17 @@ const broadcastState = () => {
       const playerIndex = isPlayer1 ? 0 : (isPlayer2 ? 1 : -1);
       
       if (gameState.phase === 'action_resolve_attack_counter' && playerIndex === gameState.activePlayerIndex) {
-        // 1. Original attack hits defender
+        // 1. Original attack hits defender (even if they played a defense card to counter)
         if (gameState.selectedTargetId) {
           const targetCard = gameState.tableCards.find(c => c.id === gameState.selectedTargetId);
           if (targetCard) {
             const damage = gameState.selectedOption === 'heavy_strike' ? 2 : 1;
             targetCard.damage = (targetCard.damage || 0) + damage;
+
+            // Interrupt chanting when attacked
+            const targetToken = gameState.tokens.find(t => t.boundToCardId === targetCard.id);
+            if (targetToken) handlers.checkAndResetChanting(targetToken.id);
+
             let damageCounter = gameState.counters.find(c => c.type === 'damage' && c.boundToCardId === targetCard.id);
             if (!damageCounter) {
                damageCounter = { id: generateId(), type: 'damage', x: targetCard.x, y: targetCard.y, value: 0, boundToCardId: targetCard.id };
@@ -1675,7 +2295,7 @@ const broadcastState = () => {
             }
             addLog(`结算阶段: ${targetCard.heroClass} 受到 ${damage} 点伤害，当前受伤计数器为 ${targetCard.damage}`, playerIndex);
 
-            gameState.notification = `攻击成功！${targetCard.heroClass} 受到了 ${damage} 点伤害。`;
+            gameState.notification = `攻击成功！${targetCard.heroClass} 受到了 ${damage} 点伤害。接下来触发反击！`;
             
             // Check hero death
             const heroData = heroesDatabase?.heroes?.find((h: any) => h.name === targetCard.heroClass);
@@ -1687,6 +2307,7 @@ const broadcastState = () => {
               const token = gameState.tokens.find(t => t.boundToCardId === targetCard.id);
               if (token) { token.x = targetCard.x; token.y = targetCard.y; }
               gameState.counters.push({ id: generateId(), type: 'time', x: targetCard.x, y: targetCard.y, value: 0, boundToCardId: targetCard.id });
+              if (token) handlers.checkAndResetChanting(token.id);
               
               addLog(`阵亡阶段: ${targetCard.heroClass} 已阵亡`, playerIndex);
               gameState.notification += ` ${targetCard.heroClass} 阵亡！`;
@@ -1702,7 +2323,21 @@ const broadcastState = () => {
                 
                 addLog(`奖励阶段: ${attackerCard?.heroClass} 击败了 ${targetCard.heroClass}，获得 ${reward} 经验和 ${reward} 金币`, playerIndex);
                 gameState.notification += ` 获得 ${reward} 经验和 ${reward} 金币。`;
+                
+                // Reputation scoring
+                addReputation(playerIndex, 2, "击杀敌方英雄");
               }
+              
+              // Skip counter-attack if defender dies
+              gameState.playAreaCards.forEach(c => gameState.discardPiles.action.push(c));
+              gameState.playAreaCards = [];
+              gameState.phase = 'action_play';
+              gameState.activePlayerIndex = 1 - gameState.activePlayerIndex;
+              gameState.selectedTargetId = null;
+              gameState.selectedTokenId = null;
+              io.emit('state_update', gameState);
+              checkBotTurn();
+              return;
             }
           }
         }
@@ -1725,7 +2360,8 @@ const broadcastState = () => {
           if (attackerToken && attackerToken.boundToCardId) {
             const attackerCard = gameState.tableCards.find(c => c.id === attackerToken.boundToCardId);
             if (attackerCard) {
-              const counterDamage = 1;
+              const counterAttackCard = gameState.playAreaCards[gameState.playAreaCards.length - 1];
+              const counterDamage = counterAttackCard?.name === '强击' ? 2 : 1;
               attackerCard.damage = (attackerCard.damage || 0) + counterDamage;
               let attackerDamageCounter = gameState.counters.find(c => c.type === 'damage' && c.boundToCardId === attackerCard.id);
               if (!attackerDamageCounter) {
@@ -1752,6 +2388,7 @@ const broadcastState = () => {
                 attackerToken.x = attackerCard.x;
                 attackerToken.y = attackerCard.y;
                 gameState.counters.push({ id: generateId(), type: 'time', x: attackerCard.x, y: attackerCard.y, value: 0, boundToCardId: attackerCard.id });
+                handlers.checkAndResetChanting(attackerToken.id);
                 
                 addLog(`阵亡阶段: ${attackerCard.heroClass} 已阵亡`, playerIndex);
                 gameState.notification += ` ${attackerCard.heroClass} 阵亡！`;
@@ -1767,6 +2404,9 @@ const broadcastState = () => {
                   
                   addLog(`奖励阶段: ${defenderCard?.heroClass} 击败了 ${attackerCard.heroClass}，获得 ${reward} 经验和 ${reward} 金币`, playerIndex);
                   gameState.notification += ` 获得 ${reward} 经验和 ${reward} 金币。`;
+                  
+                  // Reputation scoring
+                  addReputation(playerIndex, 2, "击杀敌方英雄");
                 }
               }
             }
@@ -1855,6 +2495,9 @@ const broadcastState = () => {
           if (gameState.selectedTargetId) {
             const targetCard = gameState.tableCards.find(c => c.id === gameState.selectedTargetId);
             if (targetCard) {
+              const targetToken = gameState.tokens.find(t => t.boundToCardId === targetCard.id);
+              if (targetToken) handlers.checkAndResetChanting(targetToken.id);
+
               const currentDamage = targetCard.damage || 0;
               if (currentDamage > 0) {
                 targetCard.damage = currentDamage - 1;
@@ -1874,13 +2517,16 @@ const broadcastState = () => {
           if (gameState.selectedTargetId && heroesDatabase) {
             const targetCard = gameState.tableCards.find(c => c.id === gameState.selectedTargetId);
             if (targetCard && targetCard.heroClass && targetCard.level) {
+              const targetToken = gameState.tokens.find(t => t.boundToCardId === targetCard.id);
+              if (targetToken) handlers.checkAndResetChanting(targetToken.id);
+
               const nextLevel = targetCard.level + 1;
               const heroData = heroesDatabase.heroes.find((h: any) => h.name === targetCard.heroClass);
               const levelData = heroData?.levels?.[targetCard.level.toString()];
               const expNeeded = levelData?.xp;
               const expCounter = gameState.counters.find(c => c.type === 'exp' && c.boundToCardId === targetCard.id);
               
-              if (expCounter && expCounter.value >= expNeeded) {
+              if (expCounter && typeof expNeeded === 'number' && expNeeded > 0 && expCounter.value >= expNeeded) {
                 // Evolve
                 targetCard.level = nextLevel;
                 targetCard.frontImage = getHeroCardImage(targetCard.heroClass, nextLevel);
@@ -1894,6 +2540,12 @@ const broadcastState = () => {
                   addLog(`玩家${playerIndex + 1} 弃掉了 ${cardName} 执行了 ${targetCard.heroClass} 的进化`, playerIndex);
                 }
                 addLog(`${targetCard.heroClass} 进化到了 Lv${nextLevel}`, playerIndex);
+
+                // Reputation gain for evolution
+                const reputationGain = nextLevel === 2 ? 1 : (nextLevel === 3 ? 2 : 0);
+                if (reputationGain > 0) {
+                  addReputation(playerIndex, reputationGain, `${targetCard.heroClass} 进化到 Lv${nextLevel}`);
+                }
 
                 // Heal 1 HP on evolve
                 if (targetCard.damage && targetCard.damage > 0) {
@@ -1956,8 +2608,8 @@ const broadcastState = () => {
               }
 
               // Spawn counters
-              gameState.counters.push({ id: generateId(), type: 'exp', x: heroX - 40, y: heroY + 80, value: 0, boundToCardId: tableCard.id });
-              gameState.counters.push({ id: generateId(), type: 'damage', x: heroX + 40, y: heroY + 80, value: 0, boundToCardId: tableCard.id });
+              gameState.counters.push({ id: generateId(), type: 'exp', x: heroX + 50, y: heroY - 30, value: 0, boundToCardId: tableCard.id });
+              gameState.counters.push({ id: generateId(), type: 'damage', x: heroX + 50, y: heroY + 180, value: 0, boundToCardId: tableCard.id });
               
               alignHireArea();
               gameState.notification = `雇佣成功！${tableCard.heroClass} 加入了战场。 (Hire successful! ${tableCard.heroClass} joined the battle.)`;
@@ -1965,26 +2617,42 @@ const broadcastState = () => {
           }
         }
 
-        // Recalculate available actions for the next player
-        updateAvailableActions(gameState.activePlayerIndex);
-
         if (!isShop) {
           gameState.phase = 'action_play';
+        }
+        if (gameState.playAreaCards.length > 0) {
+          gameState.discardPiles.action.push(...gameState.playAreaCards);
+          gameState.playAreaCards = [];
         }
         gameState.selectedOption = null;
         gameState.selectedTargetId = null;
         gameState.selectedTokenId = null;
         gameState.remainingMv = 0;
         gameState.reachableCells = [];
+        gameState.globalMovementMovedTokens = [];
         gameState.secondaryCardId = null;
         gameState.lastPlayedCardId = null;
         gameState.activePlayerIndex = 1 - gameState.activePlayerIndex;
         gameState.consecutivePasses = 0; // Reset passes if an action was taken
+        updateAvailableActions(gameState.activePlayerIndex);
         broadcastState();
         checkBotTurn();
       }
     },
-    play_card: (socket: any, { cardId, x, y }) => {
+    play_card: (socket: any, { cardId, x, y, targetCastleIndex }: { cardId: string, x?: number, y?: number, targetCastleIndex?: number }) => {
+      const isPlayer1 = gameState.seats[0] === socket.id;
+      const isPlayer2 = gameState.seats[1] === socket.id;
+      const playerIndex = isPlayer1 ? 0 : (isPlayer2 ? 1 : -1);
+
+      if (playerIndex !== -1) {
+        // Allow playing cards in active phases: action_play, discard, setup, and resolution phases
+        const allowedPhases = ['action_play', 'discard', 'setup', 'action_select_option', 'action_defend', 'action_play_defense', 'action_resolve_attack_counter', 'action_play_counter'];
+        if (!allowedPhases.includes(gameState.phase)) {
+          socket.emit('error_message', '当前阶段不允许打出卡牌。 (Cards cannot be played in the current phase.)');
+          return;
+        }
+      }
+
       const player = gameState.players[socket.id];
       if (!player) return;
       
@@ -1993,29 +2661,51 @@ const broadcastState = () => {
         const card = player.hand.splice(cardIndex, 1)[0];
         
         // Hero Play Logic
-        if (card.type === 'hero' && !gameState.heroPlayed[socket.id]) {
-          gameState.heroPlayed[socket.id] = true;
+        const playedCount = gameState.heroPlayedCount[socket.id] || 0;
+        if (card.type === 'hero' && playedCount < 2) {
+          gameState.heroPlayedCount[socket.id] = playedCount + 1;
           const isPlayer1 = gameState.seats[0] === socket.id;
           const playerIndex = isPlayer1 ? 0 : 1;
           addLog(`玩家${playerIndex + 1}选择了英雄：${card.heroClass}`, playerIndex);
           
-          // Move other heroes to hire area
-          const otherHeroes = player.hand.filter(c => c.type === 'hero');
-          player.hand = player.hand.filter(c => c.type !== 'hero');
-          otherHeroes.forEach(h => {
-            gameState.hireAreaCards.push({ ...h, x: 0, y: 0, faceUp: true });
-          });
-          alignHireArea();
+          if (gameState.heroPlayedCount[socket.id] === 2) {
+            gameState.heroPlayed[socket.id] = true;
+            // Move other heroes to hire area
+            const otherHeroes = player.hand.filter(c => c.type === 'hero');
+            player.hand = player.hand.filter(c => c.type !== 'hero');
+            otherHeroes.forEach(h => {
+              gameState.hireAreaCards.push({ ...h, x: 0, y: 0, faceUp: true });
+            });
+            alignHireArea();
+
+            // Draw 4 cards from action deck
+            for (let i = 0; i < 4; i++) {
+              if (gameState.decks.action.length > 0) {
+                player.hand.push(gameState.decks.action.pop()!);
+              } else if (gameState.discardPiles.action.length > 0) {
+                gameState.decks.action = [...gameState.discardPiles.action].sort(() => Math.random() - 0.5);
+                gameState.discardPiles.action = [];
+                if (gameState.decks.action.length > 0) {
+                  player.hand.push(gameState.decks.action.pop()!);
+                }
+              }
+            }
+          }
 
           // Position played hero
-          const heroX = -50;
+          const playerHeroes = gameState.tableCards.filter(c => c.type === 'hero' && ((isPlayer1 && c.y > 0) || (!isPlayer1 && c.y < 0)));
+          const heroCount = playerHeroes.length;
+          const heroX = -50 + (heroCount * 120);
           const heroY = isPlayer1 ? 550 : -700;
           
-          const tableCard: TableCard = { ...card, x: heroX, y: heroY, faceUp: true };
+          const tableCard: TableCard = { ...card, x: heroX, y: heroY, faceUp: true, level: 1 };
           gameState.tableCards.push(tableCard);
 
           // Spawn Hero Token in Castle
-          const castlePos = hexToPixel(0, isPlayer1 ? 4 : -4);
+          const castleIdx = (targetCastleIndex !== undefined) ? targetCastleIndex : 0;
+          const playerCastles = CASTLES[playerIndex as 0 | 1];
+          const castleCoord = playerCastles[castleIdx] || playerCastles[0];
+          const castlePos = hexToPixel(castleCoord.q, castleCoord.r);
           const tokenX = castlePos.x;
           const tokenY = castlePos.y;
           if (card.heroClass) {
@@ -2033,27 +2723,16 @@ const broadcastState = () => {
           }
 
           // Spawn Experience and Damage tokens
-          gameState.counters.push({ id: generateId(), type: 'exp', x: 0, y: heroY - 30, value: 0, boundToCardId: tableCard.id });
-          gameState.counters.push({ id: generateId(), type: 'damage', x: 0, y: heroY + 180, value: 0, boundToCardId: tableCard.id });
-
-          // Draw 4 cards from action deck
-          for (let i = 0; i < 4; i++) {
-            if (gameState.decks.action.length > 0) {
-              player.hand.push(gameState.decks.action.pop()!);
-            } else if (gameState.discardPiles.action.length > 0) {
-              gameState.decks.action = [...gameState.discardPiles.action].sort(() => Math.random() - 0.5);
-              gameState.discardPiles.action = [];
-              if (gameState.decks.action.length > 0) {
-                player.hand.push(gameState.decks.action.pop()!);
-              }
-            }
-          }
+          gameState.counters.push({ id: generateId(), type: 'exp', x: heroX + 50, y: heroY - 30, value: 0, boundToCardId: tableCard.id });
+          gameState.counters.push({ id: generateId(), type: 'damage', x: heroX + 50, y: heroY + 180, value: 0, boundToCardId: tableCard.id });
 
           // Check if both played
           const allPlayed = gameState.seats.filter(id => id !== null).every(id => gameState.heroPlayed[id!]);
           if (allPlayed) {
             gameState.decks.hero = [];
-            gameState.phase = 'action_play';
+            if (gameState.phase === 'setup') {
+              gameState.phase = 'action_play';
+            }
             gameState.activePlayerIndex = gameState.firstPlayerIndex;
             gameState.consecutivePasses = 0;
             gameState.round = 1;
@@ -2065,7 +2744,8 @@ const broadcastState = () => {
           const isPlayer2 = gameState.seats[1] === socket.id;
           const playerIndex = isPlayer1 ? 0 : (isPlayer2 ? 1 : -1);
           
-          if (gameState.phase !== 'setup' && playerIndex !== gameState.activePlayerIndex) {
+          const isInitialHero = card.type === 'hero' && !gameState.heroPlayed[socket.id];
+          if (gameState.phase !== 'setup' && !isInitialHero && playerIndex !== gameState.activePlayerIndex) {
             socket.emit('error_message', '现在不是你的回合，无法打出卡牌。');
             player.hand.push(card);
             return;
@@ -2102,8 +2782,8 @@ const broadcastState = () => {
             }
           }
 
-          if (gameState.phase === 'action_play_defense' || gameState.phase === 'action_resolve_attack_counter') {
-            if (card.name !== '防御') {
+          if (gameState.phase === 'action_play_defense') {
+            if (card.name !== '防御' && card.name !== '闪避') {
               socket.emit('error_message', '只能打出防御卡。 (Only defense cards can be played.)');
               player.hand.push(card);
               return;
@@ -2128,7 +2808,7 @@ const broadcastState = () => {
             gameState.movedTokens = undefined;
             gameState.movementHistory = undefined;
             
-            if (gameState.phase === 'action_play') {
+            if (gameState.phase === 'action_play' || gameState.phase === 'setup') {
               addLog(`玩家${playerIndex + 1}打出了${card.name}`, playerIndex);
               gameState.phase = 'action_select_option';
               gameState.selectedOption = null;
@@ -2180,13 +2860,6 @@ const broadcastState = () => {
               gameState.selectedTargetId = null;
               gameState.secondaryCardId = null;
               gameState.consecutivePasses = 0;
-
-              // Check hire condition
-              const isPlayer1 = gameState.seats[0] === socket.id;
-              const isPlayer2 = gameState.seats[1] === socket.id;
-              const goldCounter = gameState.counters.find(c => c.type === 'gold' && (isPlayer1 ? (c.x === -150 && c.y === 550) : (c.x === -150 && c.y === -700)));
-              const totalHeroes = gameState.tableCards.filter(c => c.type === 'hero' && ((isPlayer1 && c.y > 0) || (isPlayer2 && c.y < 0))).length;
-              gameState.canHire = (goldCounter && goldCounter.value >= 2 && gameState.hireAreaCards.length > 0 && totalHeroes < 4);
             }
           }
         }
@@ -2263,30 +2936,33 @@ const broadcastState = () => {
         checkBotTurn(); // Trigger bots to finish their discard
       }
     },
-    hire_hero: (socket: any, { cardId, goldAmount }) => {
+    hire_hero: (socket: any, { cardId, goldAmount, targetCastleIndex }: { cardId: string, goldAmount: number, targetCastleIndex: number }) => {
       const player = gameState.players[socket.id];
       if (!player) return;
-
+ 
       const isPlayer1 = gameState.seats[0] === socket.id;
       const isPlayer2 = gameState.seats[1] === socket.id;
       if (!isPlayer1 && !isPlayer2) return; // Only seated players can hire
-
+ 
       const playerIndex = isPlayer1 ? 0 : 1;
       // Allow hire in shop phase OR action_select_option phase
       if (!['shop', 'action_select_option'].includes(gameState.phase) || playerIndex !== gameState.activePlayerIndex) {
         socket.emit('error_message', '现在不是你的雇佣时机。');
         return;
       }
-
+ 
       const cardIndex = gameState.hireAreaCards.findIndex(c => c.id === cardId);
       if (cardIndex === -1) return;
-
-      const tokenY = isPlayer1 ? 311.7 : -311.7;
-
-      // Check if castle already has a hero token
-      const castleHasHero = gameState.tokens.some(t => Math.abs(t.x) < 10 && Math.abs(t.y - tokenY) < 10);
-      if (castleHasHero) {
-        socket.emit('error_message', '雇佣失败：您的王城中已经有英雄了。');
+ 
+      const playerCastles = CASTLES[playerIndex as 0 | 1];
+      const castleIdx = (targetCastleIndex !== undefined) ? targetCastleIndex : 0;
+      const castleCoord = playerCastles[castleIdx] || playerCastles[0];
+      const castlePos = hexToPixel(castleCoord.q, castleCoord.r);
+ 
+      // Check if selected castle already has a hero token
+      const castleOccupied = gameState.tokens.some(t => Math.abs(t.x - castlePos.x) < 10 && Math.abs(t.y - castlePos.y) < 10);
+      if (castleOccupied) {
+        socket.emit('error_message', '雇佣失败：所选王城中已经有英雄了。');
         return;
       }
 
@@ -2322,12 +2998,11 @@ const broadcastState = () => {
       gameState.tableCards.push(tableCard);
 
       // Spawn Hero Token in Castle
-      const tokenX = 0; // No offset
       if (card.heroClass) {
         const heroToken: Token = {
           id: generateId(),
-          x: tokenX,
-          y: tokenY,
+          x: castlePos.x,
+          y: castlePos.y,
           image: getHeroTokenImage(card.heroClass),
           label: `${card.heroClass} Lv1`,
           lv: 1,
@@ -2338,8 +3013,8 @@ const broadcastState = () => {
       }
 
       // Spawn Experience and Damage tokens
-      gameState.counters.push({ id: generateId(), type: 'exp', x: heroX, y: heroY + 80, value: Math.max(0, goldAmount - 2), boundToCardId: tableCard.id });
-      gameState.counters.push({ id: generateId(), type: 'damage', x: heroX + 80, y: heroY + 80, value: 0, boundToCardId: tableCard.id });
+      gameState.counters.push({ id: generateId(), type: 'exp', x: heroX + 50, y: heroY - 30, value: Math.max(0, goldAmount - 2), boundToCardId: tableCard.id });
+      gameState.counters.push({ id: generateId(), type: 'damage', x: heroX + 50, y: heroY + 180, value: 0, boundToCardId: tableCard.id });
 
       // If hired during action phase, finish resolve
       if (gameState.phase === 'action_select_option') {
@@ -2351,6 +3026,7 @@ const broadcastState = () => {
         gameState.selectedTokenId = null;
         gameState.remainingMv = 0;
         gameState.reachableCells = [];
+        gameState.globalMovementMovedTokens = [];
         gameState.activePlayerIndex = 1 - gameState.activePlayerIndex;
         broadcastState();
         checkBotTurn();
@@ -2374,6 +3050,7 @@ const broadcastState = () => {
       discardFinished: false
     };
     gameState.heroPlayed[socket.id] = false;
+    gameState.heroPlayedCount[socket.id] = 0;
 
     socket.emit('init', gameState);
     socket.broadcast.emit('state_update', gameState);
@@ -2401,6 +3078,7 @@ const broadcastState = () => {
             botDifficulty: 0
           };
           gameState.heroPlayed[botId] = false;
+          gameState.heroPlayedCount[botId] = 0;
         }
       }
 
@@ -2429,6 +3107,7 @@ const broadcastState = () => {
           botDifficulty: difficulty
         };
         gameState.heroPlayed[botId] = false;
+        gameState.heroPlayedCount[botId] = 0;
         io.emit('state_update', gameState);
       }
     });
@@ -2454,6 +3133,9 @@ const broadcastState = () => {
           gameState.players[socket.id] = { ...gameState.players[oldPlayerId], id: socket.id };
           if (gameState.heroPlayed[oldPlayerId] !== undefined) {
              gameState.heroPlayed[socket.id] = gameState.heroPlayed[oldPlayerId];
+          }
+          if (gameState.heroPlayedCount[oldPlayerId] !== undefined) {
+             gameState.heroPlayedCount[socket.id] = gameState.heroPlayedCount[oldPlayerId];
           }
           gameState.seats[seatIndex] = socket.id;
           
@@ -2664,7 +3346,7 @@ const broadcastState = () => {
       }
     });
 
-    socket.on('play_card', ({ cardId, x, y }) => handlers.play_card(socket, { cardId, x, y }));
+    socket.on('play_card', ({ cardId, x, y, targetCastleIndex }) => handlers.play_card(socket, { cardId, x, y, targetCastleIndex }));
 
     socket.on('undo_play', () => {
       const player = gameState.players[socket.id];
@@ -2703,14 +3385,56 @@ const broadcastState = () => {
         } else if (gameState.selectedTargetId) {
           gameState.selectedTargetId = null;
           broadcastState();
-        } else if (gameState.movementHistory && gameState.movementHistory.length > 0) {
-          // Granular movement undo
+        } else if (gameState.movementHistory && gameState.movementHistory.length > 0 && (!gameState.selectedTokenId || gameState.movementHistory[gameState.movementHistory.length - 1].tokenId === gameState.selectedTokenId)) {
+          // Granular movement undo for the CURRENTLY selected token, or the LAST moved token if none is selected
           const lastStep = gameState.movementHistory.pop()!;
           const token = gameState.tokens.find(t => t.id === lastStep.tokenId);
+          
           if (token) {
+            // If we are reverting a token that was finalized, re-select it
+            if (!gameState.selectedTokenId) {
+              gameState.selectedTokenId = token.id;
+              // Remove it from globalMovementMovedTokens
+              if (gameState.globalMovementMovedTokens) {
+                gameState.globalMovementMovedTokens = gameState.globalMovementMovedTokens.filter(id => id !== token.id);
+              }
+              
+              // Recalculate remainingMv for this token based on total movement history
+              const card = gameState.tableCards.find(c => c.id === token.boundToCardId);
+              if (card) {
+                const heroData = heroesDatabase?.heroes?.find((h: any) => h.name === card.heroClass);
+                const levelData = heroData?.levels?.[card.level || 1];
+                let mv = levelData?.mv || 1;
+                if (gameState.selectedOption === 'sprint') mv += 1;
+                
+                // Sum up remaining movement history for this token
+                const totalMvCost = gameState.movementHistory.filter(step => step.tokenId === token.id).reduce((sum, step) => sum + step.mvCost, 0);
+                gameState.remainingMv = mv - totalMvCost;
+              }
+            } else {
+              gameState.remainingMv! += lastStep.mvCost;
+            }
+            
             token.x = lastStep.fromX;
             token.y = lastStep.fromY;
-            gameState.remainingMv! += lastStep.mvCost;
+            
+            // Decrement action count if this was the first move of the action
+            const hasOtherMoves = gameState.movementHistory?.some(step => step.tokenId === token.id && step.mvCost > 0);
+            if (!hasOtherMoves && lastStep.mvCost > 0) {
+              if (gameState.roundActionCounts[token.id]) {
+                gameState.roundActionCounts[token.id]--;
+              }
+            }
+            
+            // Restore chanting state if it was interrupted by this movement
+            if (lastStep.wasChanting) {
+              const hex = pixelToHex(token.x, token.y);
+              const magicCircle = gameState.magicCircles?.find(mc => mc.q === hex.q && mc.r === hex.r);
+              if (magicCircle) {
+                magicCircle.state = 'chanting';
+                magicCircle.chantingTokenId = token.id;
+              }
+            }
             
             // Re-calculate reachable cells from new (old) position
             const hex = pixelToHex(token.x, token.y);
@@ -2719,9 +3443,27 @@ const broadcastState = () => {
           broadcastState();
         } else if (gameState.selectedTokenId) {
           // Deselect token
+          const deselectedTokenId = gameState.selectedTokenId;
           gameState.selectedTokenId = null;
           gameState.remainingMv = 0;
           gameState.reachableCells = [];
+          
+          // If there is a previous token in movement history, we might want to revert to it
+          if (gameState.movementHistory && gameState.movementHistory.length > 0) {
+             const prevTokenId = gameState.movementHistory[gameState.movementHistory.length - 1].tokenId;
+             // Remove the deselected token from globalMovementMovedTokens if it was added
+             if (gameState.globalMovementMovedTokens) {
+               gameState.globalMovementMovedTokens = gameState.globalMovementMovedTokens.filter(id => id !== deselectedTokenId);
+             }
+             
+             // We don't automatically select the previous token, the user can click it again.
+             // But we need to make sure the previous token is no longer in globalMovementMovedTokens
+             // so it can be selected again.
+             if (gameState.globalMovementMovedTokens) {
+               gameState.globalMovementMovedTokens = gameState.globalMovementMovedTokens.filter(id => id !== prevTokenId);
+             }
+          }
+          
           broadcastState();
         } else if (gameState.selectedOption) {
           // Deselect option
@@ -2729,6 +3471,7 @@ const broadcastState = () => {
           gameState.selectedTokenId = null;
           gameState.remainingMv = 0;
           gameState.reachableCells = [];
+          gameState.globalMovementMovedTokens = [];
           gameState.movementHistory = undefined;
           broadcastState();
         } else if (gameState.lastPlayedCardId) {
@@ -2951,7 +3694,9 @@ const broadcastState = () => {
       }
     });
 
-    socket.on('hire_hero', ({ cardId, goldAmount }) => handlers.hire_hero(socket, { cardId, goldAmount }));
+    socket.on('hire_hero', ({ cardId, goldAmount, targetCastleIndex }) => handlers.hire_hero(socket, { cardId, goldAmount, targetCastleIndex }));
+    socket.on('revive_hero', ({ heroCardId, targetCastleIndex }) => handlers.revive_hero(socket, { heroCardId, targetCastleIndex }));
+    socket.on('select_hire_cost', (cost) => handlers.select_hire_cost(socket, cost));
 
     socket.on('evolve_hero', (cardId) => {
       const card = gameState.tableCards.find(c => c.id === cardId);
@@ -2961,7 +3706,7 @@ const broadcastState = () => {
         const levelData = heroData?.levels?.[card.level.toString()];
         const expNeeded = levelData?.xp;
 
-        if (expCounter && expNeeded !== undefined && expCounter.value >= expNeeded) {
+        if (expCounter && typeof expNeeded === 'number' && expNeeded > 0 && expCounter.value >= expNeeded) {
           expCounter.value -= expNeeded;
           card.level += 1;
           card.frontImage = getHeroCardImage(card.heroClass, card.level);
