@@ -4,6 +4,7 @@ import Konva from 'konva';
 import useImage from 'use-image';
 import { Socket } from 'socket.io-client';
 import { GameState, TableCard, Token, Counter, Card, GameLog } from '../types';
+import { HEX_SIZE, hexToPixel, pixelToHex, hexRound } from '../mapConstants';
 import { ZoomIn, ZoomOut, Maximize } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
@@ -19,38 +20,10 @@ interface TabletopProps {
   setSelectedHireCardId: (id: string | null) => void;
 }
 
-const HEX_SIZE = 45;
 const CASTLES = {
   0: [{ q: 0, r: 4 }, { q: 4, r: 0 }],
   1: [{ q: 0, r: -4 }, { q: -4, r: 0 }]
 };
-
-function pixelToHex(x: number, y: number) {
-  const q = (2/3 * x) / HEX_SIZE;
-  const r = (-1/3 * x + Math.sqrt(3)/3 * y) / HEX_SIZE;
-  return hexRound(q, r);
-}
-
-function hexRound(q: number, r: number) {
-  let rq = Math.round(q);
-  let rr = Math.round(r);
-  let rs = Math.round(-q - r);
-  const q_diff = Math.abs(rq - q);
-  const r_diff = Math.abs(rr - r);
-  const s_diff = Math.abs(rs - (-q - r));
-  if (q_diff > r_diff && q_diff > s_diff) {
-      rq = -rr - rs;
-  } else if (r_diff > s_diff) {
-      rr = -rq - rs;
-  }
-  return { q: rq, r: rr };
-}
-
-function hexToPixel(q: number, r: number) {
-  const x = HEX_SIZE * 1.5 * q;
-  const y = HEX_SIZE * Math.sqrt(3) * (r + q/2);
-  return { x, y };
-}
 
 function HexNode({ q, r, x, y, fill, icon, onContextMenu, highlightColor, onClick, magicCircleState }: { q: number, r: number, x: number, y: number, fill: string, icon: string, onContextMenu: any, highlightColor?: string, onClick?: (q: number, r: number) => void, magicCircleState?: string }) {
   const points = [];
@@ -144,7 +117,7 @@ function HexNode({ q, r, x, y, fill, icon, onContextMenu, highlightColor, onClic
   );
 }
 
-function HexGridLayer({ onHexContextMenu, reachableCells, onHexClick, selectedOption, magicCircles, selectedHeroCardId, selectedHireCardId, playerIndex, phase, pendingRevivals }: { onHexContextMenu: (e: any, x: number, y: number, clientX?: number, clientY?: number) => void, reachableCells?: { q: number, r: number }[], onHexClick?: (q: number, r: number) => void, selectedOption?: string | null, magicCircles?: { q: number, r: number, state: string }[], selectedHeroCardId?: string | null, selectedHireCardId?: string | null, playerIndex: number, phase?: string, pendingRevivals?: any[] }) {
+function HexGridLayer({ onHexContextMenu, reachableCells, onHexClick, selectedOption, magicCircles, selectedHeroCardId, selectedHireCardId, playerIndex, phase, pendingRevivals, mapConfig }: { onHexContextMenu: (e: any, x: number, y: number, clientX?: number, clientY?: number) => void, reachableCells?: { q: number, r: number }[], onHexClick?: (q: number, r: number) => void, selectedOption?: string | null, magicCircles?: { q: number, r: number, state: string }[], selectedHeroCardId?: string | null, selectedHireCardId?: string | null, playerIndex: number, phase?: string, pendingRevivals?: any[], mapConfig?: any }) {
   const hexes = [];
   const radius = 4;
   
@@ -161,24 +134,54 @@ function HexGridLayer({ onHexContextMenu, reachableCells, onHexClick, selectedOp
       const magicCircle = magicCircles?.find(mc => mc.q === q && mc.r === r);
       if (magicCircle) {
         icon = "✨";
-      } else if (q === 0 && r === 0) { fill = "#bfdbfe"; icon = "💎"; } // Crystal
-      else if ((q === 0 && r === 4) || (q === 4 && r === 0)) { fill = "#fee2e2"; icon = "🏰"; } // P1 Castle
-      else if ((q === 0 && r === -4) || (q === -4 && r === 0)) { fill = "#dcfce7"; icon = "🏰"; } // P2 Castle
-      else if ((q === -1 && r === 3) || (q === 1 && r === -3)) { fill = "#fef08a"; icon = "📦"; } // T1
-      else if ((q === 1 && r === 1) || (q === -1 && r === -1)) { fill = "#fde68a"; icon = "👑"; } // T2
-      else if ((q === -2 && r === 4) || (q === 2 && r === 2) || (q === -2 && r === -2) || (q === 2 && r === -4)) { fill = "#fbcfe8"; icon = "👾"; } // M1
-      else if ((q === -3 && r === 1) || (q === -1 && r === 1) || (q === 3 && r === -1) || (q === 1 && r === -1)) { fill = "#f87171"; icon = "💀"; } // M2
-      else if ((q === -3 && r === 3) || (q === 3 && r === -3)) { fill = "#fca5a5"; icon = "🐉"; } // M3
+      } else if (mapConfig) {
+        if (mapConfig.crystal && q === mapConfig.crystal.q && r === mapConfig.crystal.r) { fill = "#bfdbfe"; icon = "💎"; } // Crystal
+        else if (mapConfig.castles[0]?.some((c: any) => c.q === q && c.r === r)) { fill = "#fee2e2"; icon = "🏰"; } // P1 Castle
+        else if (mapConfig.castles[1]?.some((c: any) => c.q === q && c.r === r)) { fill = "#dcfce7"; icon = "🏰"; } // P2 Castle
+        else if (mapConfig.chests?.some((c: any) => c.q === q && c.r === r)) { fill = "#fef08a"; icon = "📦"; } // Chests
+        else {
+          const monster = mapConfig.monsters?.find((m: any) => m.q === q && m.r === r);
+          if (monster) {
+            if (monster.level === 1) { fill = "#fbcfe8"; icon = "👾"; }
+            else if (monster.level === 2) { fill = "#f87171"; icon = "💀"; }
+            else if (monster.level === 3) { fill = "#fca5a5"; icon = "🐉"; }
+          } else if (mapConfig.traps?.some((t: any) => t.q === q && t.r === r)) {
+            fill = "#fca5a5"; icon = "🕸️"; // Trap
+          } else if (mapConfig.turrets?.some((t: any) => t.q === q && t.r === r)) {
+            fill = "#cbd5e1"; icon = "🏹"; // Turret
+          } else if (mapConfig.watchtowers?.some((t: any) => t.q === q && t.r === r)) {
+            fill = "#fef3c7"; icon = "👁️"; // Watchtower
+          } else if (mapConfig.obstacles?.some((o: any) => o.q === q && o.r === r)) {
+            fill = "#94a3b8"; icon = "⛰️"; // Obstacle
+          } else if (mapConfig.water?.some((w: any) => w.q === q && w.r === r)) {
+            fill = "#93c5fd"; icon = "🌊"; // Water
+          } else if (mapConfig.bushes?.some((b: any) => b.q === q && b.r === r)) {
+            fill = "#86efac"; icon = "🌿"; // Bush
+          }
+        }
+      } else {
+        // Fallback if no mapConfig
+        if (q === 0 && r === 0) { fill = "#bfdbfe"; icon = "💎"; } // Crystal
+        else if ((q === 0 && r === 4) || (q === 4 && r === 0)) { fill = "#fee2e2"; icon = "🏰"; } // P1 Castle
+        else if ((q === 0 && r === -4) || (q === -4 && r === 0)) { fill = "#dcfce7"; icon = "🏰"; } // P2 Castle
+        else if ((q === -1 && r === 3) || (q === 1 && r === -3)) { fill = "#fef08a"; icon = "📦"; } // T1
+        else if ((q === 1 && r === 1) || (q === -1 && r === -1)) { fill = "#fde68a"; icon = "👑"; } // T2
+        else if ((q === -2 && r === 4) || (q === 2 && r === 2) || (q === -2 && r === -2) || (q === 2 && r === -4)) { fill = "#fbcfe8"; icon = "👾"; } // M1
+        else if ((q === -3 && r === 1) || (q === -1 && r === 1) || (q === 3 && r === -1) || (q === 1 && r === -1)) { fill = "#f87171"; icon = "💀"; } // M2
+        else if ((q === -3 && r === 3) || (q === 3 && r === -3)) { fill = "#fca5a5"; icon = "🐉"; } // M3
+      }
       
       const isReachable = reachableCells?.some(c => c.q === q && c.r === r);
-      const isAttack = selectedOption === 'attack' || selectedOption === 'heavy_strike';
+      const isAttack = selectedOption === 'attack' || selectedOption === 'heavy_strike' || selectedOption === 'turret_attack';
       let highlightColor = isReachable ? (isAttack ? "rgba(239, 68, 68, 0.4)" : "rgba(253, 224, 71, 0.4)") : undefined;
 
       // Highlight castles for deployment/hiring/revival
-      const isCastle = (q === 0 && r === 4) || (q === 4 && r === 0) || (q === 0 && r === -4) || (q === -4 && r === 0);
+      const isCastle = mapConfig ? 
+        (mapConfig.castles[0]?.some((c: any) => c.q === q && c.r === r) || mapConfig.castles[1]?.some((c: any) => c.q === q && c.r === r)) :
+        ((q === 0 && r === 4) || (q === 4 && r === 0) || (q === 0 && r === -4) || (q === -4 && r === 0));
       if (isCastle) {
-        const playerCastles = CASTLES[playerIndex as 0 | 1];
-        const isMyCastle = playerCastles?.some(c => c.q === q && c.r === r);
+        const playerCastles = mapConfig ? mapConfig.castles[playerIndex as 0 | 1] : CASTLES[playerIndex as 0 | 1];
+        const isMyCastle = playerCastles?.some((c: any) => c.q === q && c.r === r);
         
         if (isMyCastle) {
           if (selectedHeroCardId || selectedHireCardId || selectedOption === 'hire') {
@@ -582,7 +585,7 @@ function HistoryLogGroup({ logs, isVisible, position, onDragEnd }: { logs: GameL
         x={15} 
         y={12} 
       />
-      {displayLogs.map((log, i) => (
+      {displayLogs.map((log, i) => log && (
         <Group key={log.id} y={55 + i * 20}>
            <Text 
              text={`[${log.round}]`} 
@@ -889,6 +892,11 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId, i
         return `咏唱：请选择在魔法阵上的己方英雄 (Chant: Select a hero on a magic circle)`;
       } else if (gameState.selectedOption === 'fire') {
         return `开火：请选择正在咏唱的己方英雄 (Fire: Select a chanting hero)`;
+      } else if (gameState.selectedOption === 'turret_attack') {
+        if (gameState.selectedTokenId) {
+          return `已选择英雄，请点击高亮的攻击目标 (Hero selected, click a highlighted target)`;
+        }
+        return `炮台攻击：请选择在炮台上的己方英雄 (Turret Attack: Select a hero on a turret)`;
       }
       return `结算阶段：请${activePlayerStr}结算场面`;
     }
@@ -980,28 +988,23 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId, i
               </button>
             )}
             {gameState.canHire && (
-              <button onClick={() => socket.emit('select_option', 'hire')} className="px-4 py-2 bg-pink-600 hover:bg-pink-500 text-white rounded-lg font-bold">
+              <button onClick={() => socket.emit('select_option', 'hire')} className="px-4 py-2 bg-pink-600 hover:bg-pink-600 text-white rounded-lg font-bold">
                 雇佣
-              </button>
-            )}
-            {(gameState as any).canOpenChest && (
-              <button onClick={() => socket.emit('open_chest')} className="px-4 py-2 bg-yellow-600 hover:bg-yellow-500 text-white rounded-lg font-bold">
-                开宝箱
               </button>
             )}
             <button onClick={() => socket.emit('select_option', 'buy')} className="px-4 py-2 bg-amber-600 hover:bg-amber-500 text-white rounded-lg font-bold">
               购买
             </button>
-            {gameState.tokens.some(t => {
-              const c = gameState.tableCards.find(tc => tc.id === t.boundToCardId);
+            {gameState.tokens.some(t => t && (() => {
+              const c = gameState.tableCards.find(tc => tc && tc.id === t.boundToCardId);
               const isMine = c && ((gameState.seats[0] === playerId && c.y > 0) || (gameState.seats[1] === playerId && c.y < 0));
               if (!isMine) return false;
-              const isAlive = !gameState.counters.some(counter => counter.type === 'time' && counter.boundToCardId === t.boundToCardId);
+              const isAlive = !gameState.counters.some(counter => counter && counter.type === 'time' && counter.boundToCardId === t.boundToCardId);
               if (!isAlive) return false;
               const hex = pixelToHex(t.x, t.y);
               const mc = gameState.magicCircles?.find(m => m.q === hex.q && m.r === hex.r);
               return mc && mc.state === 'idle';
-            }) && (
+            })()) && (
               <button onClick={() => socket.emit('select_option', 'chant')} className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg font-bold">
                 咏唱
               </button>
@@ -1036,18 +1039,31 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId, i
                     <button onClick={() => socket.emit('select_option', 'skill')} className="px-4 py-2 bg-purple-600 hover:bg-purple-500 text-white rounded-lg font-bold">
                       技能
                     </button>
-                    {gameState.tokens.some(t => {
-                      const c = gameState.tableCards.find(tc => tc.id === t.boundToCardId);
+                    {gameState.tokens.some(t => t && (() => {
+                      const c = gameState.tableCards.find(tc => tc && tc.id === t.boundToCardId);
                       const isMine = c && ((gameState.seats[0] === playerId && c.y > 0) || (gameState.seats[1] === playerId && c.y < 0));
                       if (!isMine) return false;
-                      const isAlive = !gameState.counters.some(counter => counter.type === 'time' && counter.boundToCardId === t.boundToCardId);
+                      const isAlive = !gameState.counters.some(counter => counter && counter.type === 'time' && counter.boundToCardId === t.boundToCardId);
                       if (!isAlive) return false;
                       const hex = pixelToHex(t.x, t.y);
                       const mc = gameState.magicCircles?.find(m => m.q === hex.q && m.r === hex.r);
                       return mc && mc.state === 'chanting' && mc.chantingTokenId === t.id;
-                    }) && (
+                    })()) && (
                       <button onClick={() => socket.emit('select_option', 'fire')} className="px-4 py-2 bg-orange-600 hover:bg-orange-500 text-white rounded-lg font-bold">
                         开火
+                      </button>
+                    )}
+                    {gameState.tokens.some(t => t && (() => {
+                      const c = gameState.tableCards.find(tc => tc && tc.id === t.boundToCardId);
+                      const isMine = c && ((gameState.seats[0] === playerId && c.y > 0) || (gameState.seats[1] === playerId && c.y < 0));
+                      if (!isMine) return false;
+                      const isAlive = !gameState.counters.some(counter => counter && counter.type === 'time' && counter.boundToCardId === t.boundToCardId);
+                      if (!isAlive) return false;
+                      const hex = pixelToHex(t.x, t.y);
+                      return gameState.map?.turrets?.some(tu => tu.q === hex.q && tu.r === hex.r);
+                    })()) && (
+                      <button onClick={() => socket.emit('select_option', 'turret_attack')} className="px-4 py-2 bg-red-800 hover:bg-red-700 text-white rounded-lg font-bold">
+                        炮台攻击
                       </button>
                     )}
                   </>
@@ -1068,7 +1084,7 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId, i
           </div>
         );
       } else if (gameState.selectedOption === 'evolve') {
-        const evolvableHeroes = gameState.tableCards.filter(c => gameState.evolvableHeroIds?.includes(c.id));
+        const evolvableHeroes = gameState.tableCards.filter(c => c && gameState.evolvableHeroIds?.includes(c.id));
         
         return (
           <div className="flex flex-col gap-4 items-center">
@@ -1121,7 +1137,7 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId, i
           </div>
         );
       } else if (gameState.selectedOption === 'heal') {
-        const healableHeroes = gameState.tableCards.filter(c => gameState.healableHeroIds?.includes(c.id));
+        const healableHeroes = gameState.tableCards.filter(c => c && gameState.healableHeroIds?.includes(c.id));
         
         return (
           <div className="flex flex-col gap-4 items-center">
@@ -1163,7 +1179,7 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId, i
             </div>
           </div>
         );
-      } else if (gameState.selectedOption === 'attack' || (gameState.selectedOption === 'heavy_strike' && gameState.secondaryCardId)) {
+      } else if (gameState.selectedOption === 'attack' || (gameState.selectedOption === 'heavy_strike' && gameState.secondaryCardId) || gameState.selectedOption === 'turret_attack') {
         return (
           <div className="flex flex-col gap-4 items-center">
             <div className="text-white font-bold mb-2 bg-black/40 px-4 py-2 rounded-full backdrop-blur-sm">
@@ -1346,7 +1362,7 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId, i
   const handleHexClick = (q: number, r: number) => {
     if (gameState.phase === 'setup' && isActivePlayer) {
       if (selectedHeroCardId) {
-        const playerCastles = CASTLES[playerIndex as 0 | 1];
+        const playerCastles = gameState.map?.castles[playerIndex as 0 | 1] || CASTLES[playerIndex as 0 | 1];
         const castleIdx = playerCastles.findIndex(c => c.q === q && c.r === r);
         if (castleIdx !== -1) {
           socket.emit('play_card', { cardId: selectedHeroCardId, targetCastleIndex: castleIdx });
@@ -1359,7 +1375,7 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId, i
     if ((gameState.phase === 'shop' || gameState.phase === 'action_select_option') && isActivePlayer) {
       if ((gameState.phase === 'shop' && (selectedHireCardId || gameState.selectedTargetId) && gameState.selectedHireCost) || 
           (gameState.phase === 'action_select_option' && gameState.selectedOption === 'hire' && gameState.selectedTargetId && gameState.selectedHireCost)) {
-        const playerCastles = CASTLES[playerIndex as 0 | 1];
+        const playerCastles = gameState.map?.castles[playerIndex as 0 | 1] || CASTLES[playerIndex as 0 | 1];
         const castleIdx = playerCastles.findIndex(c => c.q === q && c.r === r);
         if (castleIdx !== -1) {
           const hireCardId = selectedHireCardId || gameState.selectedTargetId;
@@ -1375,7 +1391,7 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId, i
     if (gameState.phase === 'revival' && isActivePlayer) {
       const pending = gameState.pendingRevivals?.find(r => r.playerIndex === playerIndex);
       if (pending) {
-        const playerCastles = CASTLES[playerIndex as 0 | 1];
+        const playerCastles = gameState.map?.castles[playerIndex as 0 | 1] || CASTLES[playerIndex as 0 | 1];
         const castleIdx = playerCastles.findIndex(c => c.q === q && c.r === r);
         if (castleIdx !== -1) {
           socket.emit('revive_hero', { heroCardId: pending.heroCardId, targetCastleIndex: castleIdx });
@@ -1391,7 +1407,7 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId, i
 
   const handleTokenClick = (id: string) => {
     if (gameState.phase === 'action_select_option' && isActivePlayer) {
-      if (gameState.selectedOption === 'move' || gameState.selectedOption === 'sprint' || gameState.selectedOption === 'attack' || gameState.selectedOption === 'heavy_strike' || gameState.selectedOption === 'chant' || gameState.selectedOption === 'fire') {
+      if (gameState.selectedOption === 'move' || gameState.selectedOption === 'sprint' || gameState.selectedOption === 'attack' || gameState.selectedOption === 'heavy_strike' || gameState.selectedOption === 'chant' || gameState.selectedOption === 'fire' || gameState.selectedOption === 'turret_attack') {
         socket.emit('select_token', id);
       }
     }
@@ -1591,6 +1607,7 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId, i
           playerIndex={playerIndex}
           phase={gameState.phase}
           pendingRevivals={gameState.pendingRevivals}
+          mapConfig={gameState.map}
         />
         
         <Layer>
@@ -1658,7 +1675,7 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId, i
             </Group>
           )}
 
-          {gameState.tableCards.map(card => (
+          {gameState.tableCards.map(card => card && (
             <CardNode 
               key={card.id} 
               card={card} 
@@ -1675,7 +1692,7 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId, i
             />
           ))}
 
-          {gameState.hireAreaCards.map(card => (
+          {gameState.hireAreaCards.map(card => card && (
             <CardNode 
               key={card.id} 
               card={card} 
@@ -1698,7 +1715,7 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId, i
             />
           ))}
           
-          {gameState.playAreaCards?.map(card => (
+          {gameState.playAreaCards?.map(card => card && (
             <CardNode 
               key={card.id} 
               card={card} 
@@ -1716,10 +1733,11 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId, i
           ))}
           
           {gameState.tokens.map(token => {
+            if (!token) return null;
             const isSelected = gameState.selectedTokenId === token.id;
             const isMyToken = (() => {
               if (!token.boundToCardId) return false;
-              const card = gameState.tableCards.find(c => c.id === token.boundToCardId);
+              const card = gameState.tableCards.find(c => c && c.id === token.boundToCardId);
               if (!card) return false;
               const isPlayer1 = gameState.seats[0] === playerId;
               const isPlayer2 = gameState.seats[1] === playerId;
@@ -1741,7 +1759,7 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId, i
             );
           })}
           
-          {gameState.counters.map(counter => (
+          {gameState.counters.map(counter => counter && (
             <CounterNode key={counter.id} counter={counter} socket={socket} />
           ))}
 
@@ -1796,7 +1814,7 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId, i
                 加入手牌 (Take)
               </button>
               {(() => {
-                const card = [...gameState.tableCards, ...gameState.hireAreaCards, ...(gameState.playAreaCards || [])].find(c => c.id === menu.targetId);
+                const card = [...gameState.tableCards, ...gameState.hireAreaCards, ...(gameState.playAreaCards || [])].filter(Boolean).find(c => c && c.id === menu.targetId);
                 if (card && card.type === 'hero' && card.level && card.level < 3) {
                   return (
                     <button 
@@ -1810,7 +1828,7 @@ export default function Tabletop({ socket, gameState, setZoomedCard, playerId, i
                 return null;
               })()}
               {(() => {
-                const isHireArea = gameState.hireAreaCards.some(c => c.id === menu.targetId);
+                const isHireArea = (gameState.hireAreaCards || []).filter(Boolean).some(c => c && c.id === menu.targetId);
                 const isPlayer1 = gameState.seats[0] === playerId;
                 const isPlayer2 = gameState.seats[1] === playerId;
                 const isPlayer = isPlayer1 || isPlayer2;

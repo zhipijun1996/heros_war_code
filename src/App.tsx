@@ -1,9 +1,11 @@
 import { useEffect, useState } from 'react';
 import { io, Socket } from 'socket.io-client';
-import { GameState, Card } from './types';
+import { GameState, Card, MapConfig } from './types';
 import Tabletop from './components/Tabletop';
 import Hand from './components/Hand';
 import Controls from './components/Controls';
+import MapEditor from './components/MapEditor';
+import MapSelector from './components/MapSelector';
 
 let socket: Socket;
 
@@ -14,6 +16,7 @@ export default function App() {
   const [isHistoryVisible, setIsHistoryVisible] = useState(true);
   const [selectedHeroCardId, setSelectedHeroCardId] = useState<string | null>(null);
   const [selectedHireCardId, setSelectedHireCardId] = useState<string | null>(null);
+  const [showMapEditor, setShowMapEditor] = useState(false);
 
   useEffect(() => {
     // Connect to the same host that serves the page
@@ -80,49 +83,82 @@ export default function App() {
   return (
     <div className="flex flex-col h-screen bg-zinc-900 overflow-hidden font-sans">
       {/* Top Bar */}
-      <div className="h-14 bg-zinc-950 border-b border-zinc-800 flex items-center justify-between px-6 text-zinc-300 shrink-0">
-        <div className="font-semibold text-white tracking-tight">HexTable</div>
-        <div className="flex items-center gap-4 text-sm">
-          {gameState.gameStarted && (
-            <span className="font-bold text-amber-400 mr-2">回合 (Round): {gameState.round}</span>
+      <div className="h-14 bg-zinc-950 border-b border-zinc-800 flex items-center justify-between px-6 text-zinc-300 shrink-0 relative z-[5000]">
+        <div className="font-semibold text-white tracking-tight flex items-center gap-2 sm:gap-4">
+          <span className="text-sm sm:text-base">HexTable</span>
+          {gameState && !gameState.gameStarted && (
+            <>
+              <MapSelector onSelect={(mapConfig) => socket.emit('update_map', mapConfig)} />
+              <button 
+                onClick={() => setShowMapEditor(true)}
+                className="px-2 sm:px-3 py-1 bg-zinc-800 hover:bg-zinc-700 text-[10px] sm:text-xs rounded-md border border-zinc-700 transition-colors whitespace-nowrap"
+              >
+                🛠️ <span className="hidden sm:inline">地图编辑器</span><span className="sm:hidden">编辑器</span>
+              </button>
+            </>
           )}
-          <span>Players: {Object.keys(gameState.players).length}</span>
-          <span className="px-2 py-1 bg-zinc-800 rounded-md text-zinc-400">
-            {myPlayer?.name || `ID: ${playerId.slice(0, 4)}`}
+        </div>
+        <div className="flex items-center gap-2 sm:gap-4 text-[10px] sm:text-sm">
+          {gameState?.gameStarted && (
+            <span className="font-bold text-amber-400">回合: {gameState.round}</span>
+          )}
+          <span className="hidden sm:inline">Players: {gameState ? Object.keys(gameState.players).length : 0}</span>
+          <span className="px-2 py-1 bg-zinc-800 rounded-md text-zinc-400 max-w-[80px] sm:max-w-none truncate">
+            {myPlayer?.name || (playerId ? `ID: ${playerId.slice(0, 4)}` : 'Connecting...')}
           </span>
         </div>
       </div>
 
       {/* Main Content */}
-      <div className="flex-1 relative">
-        <Tabletop 
-          socket={socket} 
-          gameState={gameState} 
-          setZoomedCard={setZoomedCard} 
-          playerId={playerId} 
-          isHistoryVisible={isHistoryVisible} 
-          selectedHeroCardId={selectedHeroCardId}
-          setSelectedHeroCardId={setSelectedHeroCardId}
-          selectedHireCardId={selectedHireCardId}
-          setSelectedHireCardId={setSelectedHireCardId}
-        />
-        
-        {/* UI Overlay */}
-        <div className="absolute top-4 left-4 pointer-events-none">
-          <Controls socket={socket} isHistoryVisible={isHistoryVisible} setIsHistoryVisible={setIsHistoryVisible} />
-        </div>
-
-        {/* Hand */}
-        {myPlayer && (
-          <div className="absolute bottom-0 left-0 right-0 pointer-events-none">
-            <Hand 
+      <div className="flex-1 relative z-0">
+        {showMapEditor && (
+          <MapEditor 
+            onClose={() => setShowMapEditor(false)} 
+            onSave={(mapConfig) => {
+              socket.emit('update_map', mapConfig);
+              setShowMapEditor(false);
+            }} 
+          />
+        )}
+        {gameState ? (
+          <>
+            <Tabletop 
               socket={socket} 
-              hand={myPlayer.hand} 
-              setZoomedCard={setZoomedCard} 
               gameState={gameState} 
+              setZoomedCard={setZoomedCard} 
+              playerId={playerId} 
+              isHistoryVisible={isHistoryVisible} 
               selectedHeroCardId={selectedHeroCardId}
               setSelectedHeroCardId={setSelectedHeroCardId}
+              selectedHireCardId={selectedHireCardId}
+              setSelectedHireCardId={setSelectedHireCardId}
             />
+            
+            {/* UI Overlay */}
+            <div className="absolute top-4 left-4 pointer-events-none">
+              <Controls socket={socket} isHistoryVisible={isHistoryVisible} setIsHistoryVisible={setIsHistoryVisible} />
+            </div>
+
+            {/* Hand */}
+            {myPlayer && (
+              <div className="absolute bottom-0 left-0 right-0 pointer-events-none">
+                <Hand 
+                  socket={socket} 
+                  hand={myPlayer.hand} 
+                  setZoomedCard={setZoomedCard} 
+                  gameState={gameState} 
+                  selectedHeroCardId={selectedHeroCardId}
+                  setSelectedHeroCardId={setSelectedHeroCardId}
+                />
+              </div>
+            )}
+          </>
+        ) : (
+          <div className="flex-1 flex items-center justify-center text-zinc-500">
+            <div className="flex flex-col items-center gap-4">
+              <div className="w-8 h-8 border-4 border-indigo-500 border-t-transparent rounded-full animate-spin"></div>
+              <p>正在连接服务器 (Connecting to server...)</p>
+            </div>
           </div>
         )}
 

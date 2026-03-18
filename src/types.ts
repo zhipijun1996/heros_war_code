@@ -87,7 +87,28 @@ export interface MagicCircle {
   chantingTokenId?: string;
 }
 
+export interface HexCoord {
+  q: number;
+  r: number;
+}
+
+export interface MapConfig {
+  name: string;
+  crystal: HexCoord;
+  castles: { 0: HexCoord[], 1: HexCoord[] };
+  chests: { q: number, r: number, type: 'T1' | 'T2' }[];
+  monsters: { q: number, r: number, level: number }[];
+  magicCircles: HexCoord[];
+  traps: HexCoord[];
+  turrets: HexCoord[];
+  watchtowers: HexCoord[];
+  obstacles: HexCoord[];
+  water: HexCoord[];
+  bushes: HexCoord[];
+}
+
 export interface GameState {
+  map?: MapConfig;
   gameStarted: boolean;
   seats: (string | null)[];
   players: Record<string, Player>;
